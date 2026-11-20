@@ -8,28 +8,49 @@ The official client is an Electron app: high memory use, slow startup, and a slu
 
 ## Features
 
-- Sign in with a user or bot token, stored in the operating system's credential store
-- Servers, categories, channels, threads and direct messages, filtered by your permissions
+**Navigation**
+- Servers in your own order and folders, categories, channels, threads, forums and direct messages, filtered by your permissions
 - Unread markers and mention badges, synced with read state; mark a channel or server as read
-- Message history with infinite scroll, grouped by author and day
-- Send, reply, edit and delete messages; upload attachments; jump to the message a reply points at
-- `@mention`, `#channel` and `:emoji:` autocomplete in the composer
-- Emoji picker for messages and reactions, including the server's custom emoji
+- Quick switcher (`Ctrl+K`) to jump to any channel or conversation
+- Mute channels, conversations and servers
+
+**Messages**
+- History with infinite scroll, grouped by author and day
+- Send, reply, edit, delete, pin and forward messages; upload attachments
+- `@mention`, `#channel`, `:emoji:` and `/command` autocomplete in the composer
+- Emoji, GIF and sticker pickers
 - Discord markdown: bold, italic, underline, strikethrough, spoilers, inline code, code blocks, quotes, headings, lists, links, mentions and timestamps
 - Image attachments with an in-app viewer, file attachments, embeds, stickers and custom emoji
-- Reactions: view, toggle and add
-- Message search (user accounts) and pinned messages
-- Typing indicators, presence, your own status, and the member list with role colours
-- User profile cards with roles and a shortcut to message them
-- Who is in each voice channel (viewing only)
-- Quick switcher (`Ctrl+K`) to jump to any channel or conversation
+- Reactions, polls with voting, and forwarded messages
+- Message search and pinned messages; click a reply to jump to the original
 - Per-channel drafts
+
+**Threads and forums**
+- Start a thread from any message
+- Forum channels list their posts, with a form to create one
+
+**Apps**
+- Slash commands with named or positional arguments, including subcommands
+- Buttons and select menus on app messages
+
+**People**
+- Friends page with pending requests and blocked users; add, accept, remove and block
+- Group conversations, profile cards with roles, presence, and your own status
+- Typing indicators and the member list with role colours
+- Who is in each voice channel (viewing only)
+
+**App**
 - Themes, including your own
+- Leave a server, close a conversation, copy an invite link
 - Automatic reconnect and session resume
+
+### Bot accounts versus user accounts
+
+Discord only offers some features to user accounts: search, friends, GIF search, poll voting, slash commands and pressing other apps' buttons. With a bot token those are unavailable and say so when used. The user-account versions of these rely on endpoints Discord does not document, so they can break without notice.
 
 ### Not implemented
 
-Joining voice or video, screen sharing, forum and stage channel views, slash commands and other bot interactions, stickers and GIF pickers, polls, friends list and friend requests, creating threads, server folders, notification and mute settings, and server or account management.
+Voice, video and screen sharing. This needs its own audio pipeline (capture, playback, Opus, the voice UDP transport and Discord's end-to-end encryption) and is the one large area left. Also not present: stage channel controls, server and role administration, account profile editing, and file options for slash commands.
 
 ## Themes
 

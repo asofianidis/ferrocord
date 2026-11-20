@@ -27,21 +27,30 @@ pub struct Switcher {
     input: Entity<InputState>,
     results: Vec<Target>,
     selected: usize,
+    /// When set, picking a result forwards this (channel, message) there.
+    forward: Option<(Id, Id)>,
     _subs: Vec<Subscription>,
 }
 
 impl EventEmitter<SwitcherEvent> for Switcher {}
 
 impl Switcher {
-    pub fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Jump to a channel or conversation"));
+    pub fn new(
+        store: Entity<Store>,
+        forward: Option<(Id, Id)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let placeholder =
+            if forward.is_some() { "Forward to a channel or conversation" } else { "Jump to a channel or conversation" };
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         let subs = vec![cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| match event {
             InputEvent::Change => this.refilter(cx),
             InputEvent::PressEnter { .. } => this.confirm(this.selected, cx),
             _ => {}
         })];
         input.update(cx, |s, cx| s.focus(window, cx));
-        let mut this = Self { store, input, results: Vec::new(), selected: 0, _subs: subs };
+        let mut this = Self { store, input, results: Vec::new(), selected: 0, forward, _subs: subs };
         this.refilter(cx);
         this
     }
@@ -50,8 +59,12 @@ impl Switcher {
         let query = self.input.read(cx).value().trim().trim_start_matches(['#', '@']).to_lowercase();
         let store = self.store.read(cx);
         let mut scored: Vec<(u8, Target)> = Vec::new();
+        let forwarding = self.forward.is_some();
         let mut consider = |channel: Id, label: String, detail: String, kind: u8| {
-            let unread = store.is_unread(channel);
+            if forwarding && !store.can_send(channel) {
+                return;
+            }
+            let unread = !forwarding && store.is_unread(channel);
             let lower = label.to_lowercase();
             let score = if query.is_empty() {
                 // With no query, surface what needs attention.
@@ -87,7 +100,12 @@ impl Switcher {
     fn confirm(&mut self, ix: usize, cx: &mut Context<Self>) {
         if let Some(target) = self.results.get(ix) {
             let channel = target.channel;
-            self.store.update(cx, |store, cx| store.select_channel(channel, cx));
+            match self.forward {
+                Some((source, message)) => {
+                    self.store.update(cx, |store, cx| store.forward_message(channel, source, message, cx))
+                }
+                None => self.store.update(cx, |store, cx| store.select_channel(channel, cx)),
+            }
         }
         cx.emit(SwitcherEvent::Dismiss);
     }
@@ -187,7 +205,11 @@ impl Render for Switcher {
                             .px_2()
                             .text_size(px(11.))
                             .text_color(theme::text_muted())
-                            .child("\u{2191}\u{2193} to navigate \u{00b7} Enter to open \u{00b7} Esc to close"),
+                            .child(if self.forward.is_some() {
+                                "\u{2191}\u{2193} to navigate \u{00b7} Enter to forward \u{00b7} Esc to cancel"
+                            } else {
+                                "\u{2191}\u{2193} to navigate \u{00b7} Enter to open \u{00b7} Esc to close"
+                            }),
                     ),
             )
     }

@@ -90,6 +90,10 @@ impl Store {
                 { "id": "401", "last_message_id": "700" },
                 { "id": "402", "last_message_id": "800" },
             ],
+            "user_settings": { "guild_folders": [
+                { "guild_ids": ["100"] },
+                { "id": 5, "name": "Hobbies", "color": 0x34b3a0, "guild_ids": ["200", "300"] },
+            ]},
             "relationships": [
                 { "id": "2", "type": 1, "user": people[0] },
                 { "id": "4", "type": 1, "user": people[2] },
@@ -183,6 +187,7 @@ impl Store {
                 "message_snapshots": [{ "message": { "content": "Heads up: the staging server restarts at **18:00 UTC**." } }]
             })),
             msg(&people[3], 5, "Deployment is ready. Choose an action:", json!({
+                "interaction": { "name": "deploy", "user": people[0] },
                 "components": [{ "type": 1, "components": [
                     { "type": 2, "style": 3, "label": "Approve", "custom_id": "approve" },
                     { "type": 2, "style": 4, "label": "Reject", "custom_id": "reject" },

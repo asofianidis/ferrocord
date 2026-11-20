@@ -594,6 +594,17 @@ pub struct Message {
     pub flags: u64,
     #[serde(default)]
     pub application_id: Option<Id>,
+    /// Set on a bot's reply to a slash command.
+    #[serde(default)]
+    pub interaction: Option<MessageInteraction>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct MessageInteraction {
+    #[serde(default, deserialize_with = "de_null")]
+    pub name: String,
+    #[serde(default)]
+    pub user: User,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

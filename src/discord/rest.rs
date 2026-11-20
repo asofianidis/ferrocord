@@ -330,6 +330,25 @@ impl Rest {
         Ok(self.send(|| self.request(Method::POST, &path).json(&body)).await?.json().await?)
     }
 
+    /// The slash commands available in a guild, or in a DM channel. User accounts only.
+    pub async fn command_index(&self, guild: Option<Id>, channel: Id) -> Result<Value> {
+        let path = match guild {
+            Some(guild) => format!("/guilds/{guild}/application-command-index"),
+            None => format!("/channels/{channel}/application-command-index"),
+        };
+        Ok(self.send(|| self.request(Method::GET, &path)).await?.json().await?)
+    }
+
+    pub async fn forward(&self, target: Id, source: Id, message: Id, guild: Option<Id>, nonce: Id) -> Result<Message> {
+        let path = format!("/channels/{target}/messages");
+        let mut reference = json!({ "type": 1, "message_id": message.to_string(), "channel_id": source.to_string() });
+        if let Some(guild) = guild {
+            reference["guild_id"] = json!(guild.to_string());
+        }
+        let body = json!({ "message_reference": reference, "nonce": nonce.to_string() });
+        Ok(self.send(|| self.request(Method::POST, &path).json(&body)).await?.json().await?)
+    }
+
     pub async fn open_dm(&self, user: Id) -> Result<Channel> {
         let body = json!({ "recipient_id": user.to_string() });
         Ok(self

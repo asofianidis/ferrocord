@@ -135,6 +135,7 @@ impl Render for Rail {
         let dm_unread = store.dm_unread();
 
         struct Entry {
+            folder: Option<usize>,
             id: Id,
             name: String,
             icon: Option<String>,
@@ -146,10 +147,25 @@ impl Render for Rail {
             .iter()
             .map(|g| {
                 let (unread, mentions) = store.guild_unread(g.guild.id);
-                Entry { id: g.guild.id, name: g.guild.name.clone(), icon: g.guild.icon_url(128), unread, mentions }
+                let folder = store.folders.iter().position(|f| f.guilds.contains(&g.guild.id));
+                Entry { folder, id: g.guild.id, name: g.guild.name.clone(), icon: g.guild.icon_url(128), unread, mentions }
             })
             .collect();
 
+        // (id, name, colour, collapsed) for each folder.
+        let folders: Vec<(i64, String, Hsla, bool)> = store
+            .folders
+            .iter()
+            .map(|f| {
+                let id = f.id.unwrap_or_default();
+                (
+                    id,
+                    f.name.clone().unwrap_or_else(|| "Folder".into()),
+                    f.color.map(theme::c).unwrap_or_else(theme::accent),
+                    store.collapsed_folders.contains(&id),
+                )
+            })
+            .collect();
         let mut items = Vec::with_capacity(entries.len() + 2);
         items.push(
             self.item(0, None, "Direct Messages".into(), home_visual, home_selected, dm_unread > 0, dm_unread, cx)
@@ -158,7 +174,76 @@ impl Render for Rail {
         items.push(
             div().w(px(32.)).h(px(2.)).flex_shrink_0().rounded_full().bg(theme::bg_active()).into_any_element(),
         );
+        // A run of servers that share a folder is drawn inside one container.
+        struct Group {
+            folder: usize,
+            children: Vec<AnyElement>,
+            unread: bool,
+            mentions: u32,
+            selected: bool,
+        }
+        let mut group: Option<Group> = None;
+        let flush = |group: Option<Group>, items: &mut Vec<AnyElement>, cx: &mut Context<Self>| {
+            let Some(group) = group else { return };
+            let (folder_id, name, tint, collapsed) = folders[group.folder].clone();
+            let header = div()
+                .id(("folder", group.folder))
+                .relative()
+                .w_full()
+                .h(px(48.))
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .child(
+                    div()
+                        .size(px(46.))
+                        .rounded(px(14.))
+                        .bg(tint.opacity(0.22))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon(if collapsed { IconName::Folder } else { IconName::FolderOpen }, 22., tint)),
+                )
+                .when(collapsed && (group.unread || group.selected), |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top(px(if group.selected { 6. } else { 20. }))
+                            .w(px(4.))
+                            .h(px(if group.selected { 36. } else { 8. }))
+                            .rounded_r_md()
+                            .bg(theme::text_bright()),
+                    )
+                })
+                .when(collapsed && group.mentions > 0, |d| {
+                    d.child(div().absolute().right(px(4.)).bottom(px(0.)).child(badge(group.mentions)))
+                })
+                .tooltip(tip(name))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.store.update(cx, |store, cx| store.toggle_folder(folder_id, cx));
+                }));
+            items.push(
+                v_flex()
+                    .w(px(60.))
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap_2()
+                    .rounded(px(18.))
+                    .bg(theme::bg_sidebar())
+                    .when(!collapsed, |d| d.pb_1())
+                    .child(header)
+                    .when(!collapsed, |d| d.children(group.children))
+                    .into_any_element(),
+            );
+        };
+
         for entry in entries {
+            if group.as_ref().map(|g| g.folder) != entry.folder {
+                flush(group.take(), &mut items, cx);
+            }
             let is_selected = selected == Some(entry.id);
             let radius = if is_selected { px(14.) } else { px(23.) };
             let visual = match entry.icon {
@@ -180,20 +265,26 @@ impl Render for Rail {
                     .child(initials(&entry.name))
                     .into_any_element(),
             };
-            items.push(
-                self.item(
-                    entry.id.0,
-                    Some(entry.id),
-                    entry.name,
-                    visual,
-                    is_selected,
-                    entry.unread,
-                    entry.mentions,
-                    cx,
-                )
-                .into_any_element(),
-            );
+            let element =
+                self.item(entry.id.0, Some(entry.id), entry.name, visual, is_selected, entry.unread, entry.mentions, cx);
+            match entry.folder {
+                Some(folder) => {
+                    let g = group.get_or_insert(Group {
+                        folder,
+                        children: Vec::new(),
+                        unread: false,
+                        mentions: 0,
+                        selected: false,
+                    });
+                    g.children.push(element);
+                    g.unread |= entry.unread;
+                    g.mentions += entry.mentions;
+                    g.selected |= is_selected;
+                }
+                None => items.push(element),
+            }
         }
+        flush(group.take(), &mut items, cx);
 
         div()
             .id("rail")

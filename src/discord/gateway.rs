@@ -2,6 +2,8 @@
 //! automatic reconnection. Events are forwarded to the UI over a channel.
 
 use super::model::*;
+use super::proto::{self, Folder};
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -39,6 +41,8 @@ pub struct Ready {
     pub relationships: Vec<(User, u8)>,
     /// Mute state of guilds and channels (user accounts only).
     pub mutes: Vec<(Id, bool)>,
+    /// Server order and folders (user accounts only).
+    pub folders: Vec<Folder>,
 }
 
 #[derive(Debug)]
@@ -622,7 +626,25 @@ pub fn parse_ready(mut d: Value) -> Ready {
     }
     let mutes = guild_settings.as_array().into_iter().flatten().flat_map(parse_mutes).collect();
 
+    // Folders live in the binary settings blob; older payloads had them as JSON.
+    let mut folders = d["user_settings_proto"]
+        .as_str()
+        .and_then(|encoded| base64::engine::general_purpose::STANDARD.decode(encoded).ok())
+        .map(|bytes| proto::guild_folders(&bytes))
+        .unwrap_or_default();
+    if folders.is_empty() {
+        for f in d["user_settings"]["guild_folders"].as_array().into_iter().flatten() {
+            folders.push(Folder {
+                id: f["id"].as_i64(),
+                name: f["name"].as_str().filter(|n| !n.is_empty()).map(str::to_string),
+                color: f["color"].as_u64().map(|c| c as u32),
+                guilds: f["guild_ids"].as_array().into_iter().flatten().filter_map(id_of).collect(),
+            });
+        }
+    }
+
     Ready {
+        folders,
         relationships,
         mutes,
         session_id: String::new(),

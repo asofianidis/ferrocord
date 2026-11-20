@@ -62,6 +62,9 @@ impl AppView {
             StoreEvent::Error(message) => {
                 window.push_notification(Notification::error(message.clone()), cx);
             }
+            StoreEvent::Notice(message) => {
+                window.push_notification(Notification::success(message.clone()), cx);
+            }
             StoreEvent::Clipboard { text, notice } => {
                 cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                 window.push_notification(Notification::success(notice.clone()), cx);
@@ -73,10 +76,14 @@ impl AppView {
         })];
 
         let mut subs = subs;
-        subs.push(cx.subscribe(&chat, |this, _, event: &chat::ChatEvent, cx| match event {
+        subs.push(cx.subscribe_in(&chat, window, |this, _, event: &chat::ChatEvent, window, cx| match event {
             chat::ChatEvent::OpenImage(url) => {
                 this.lightbox = Some(url.clone());
                 cx.notify();
+            }
+            chat::ChatEvent::Forward { channel, message } => {
+                this.switcher = None;
+                this.open_switcher(Some((*channel, *message)), window, cx);
             }
         }));
 
@@ -122,10 +129,19 @@ impl AppView {
             self.close_switcher(window, cx);
             return;
         }
+        self.open_switcher(None, window, cx);
+    }
+
+    fn open_switcher(
+        &mut self,
+        forward: Option<(crate::discord::Id, crate::discord::Id)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.store.read(cx).me.is_none() {
             return;
         }
-        let switcher = cx.new(|cx| switcher::Switcher::new(self.store.clone(), window, cx));
+        let switcher = cx.new(|cx| switcher::Switcher::new(self.store.clone(), forward, window, cx));
         self._switcher_sub = Some(cx.subscribe_in(
             &switcher,
             window,

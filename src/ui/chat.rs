@@ -36,6 +36,8 @@ const QUICK_REACTIONS: [&str; 6] = ["👍", "❤️", "😂", "🎉", "😮", "�
 pub enum ChatEvent {
     /// Show an image in the full-window viewer.
     OpenImage(String),
+    /// Ask where to forward a message.
+    Forward { channel: Id, message: Id },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -256,6 +258,10 @@ impl ChatView {
                 cx.notify();
             }
             StoreEvent::Channels => cx.notify(),
+            StoreEvent::Commands => {
+                self.completion = self.compute_completion(cx);
+                cx.notify();
+            }
             StoreEvent::Typing(channel) if Some(*channel) == self.channel => cx.notify(),
             StoreEvent::Messages { channel, change } if Some(*channel) == self.channel => {
                 let count = self.message_count(cx);
@@ -325,6 +331,9 @@ impl ChatView {
             InputEvent::PressEnter { shift: false, .. } => self.submit(window, cx),
             InputEvent::Change => {
                 let Some(channel) = self.channel else { return };
+                if self.composer.read(cx).value().starts_with('/') {
+                    self.store.update(cx, |store, cx| store.load_commands(channel, cx));
+                }
                 self.completion = self.compute_completion(cx);
                 cx.notify();
                 if self.editing.is_some() || self.composer.read(cx).value().trim().is_empty() {
@@ -357,6 +366,17 @@ impl ChatView {
                 self.store.update(cx, |store, cx| store.edit_message(channel, message, content, cx));
             }
             self.composer.update(cx, |s, cx| s.set_value("", window, cx));
+            cx.notify();
+            return;
+        }
+
+        if let Some(accepted) = self.try_command(channel, &content, cx) {
+            if accepted {
+                self.composer.update(cx, |s, cx| s.set_value("", window, cx));
+            } else {
+                // Keep the friendly names working for the retry.
+                self.replacements = replacements;
+            }
             cx.notify();
             return;
         }
@@ -710,6 +730,9 @@ impl ChatView {
             return None;
         }
         let before = &text[..cursor];
+        if let Some(typed) = before.strip_prefix('/').filter(|t| !t.contains('\n')) {
+            return self.command_completion(channel, typed, cx);
+        }
         let start = before.char_indices().rev().find(|(_, c)| c.is_whitespace()).map_or(0, |(i, c)| i + c.len_utf8());
         let mut chars = before[start..].chars();
         let trigger = chars.next()?;
@@ -764,6 +787,56 @@ impl ChatView {
             _ => return None,
         };
         (!items.is_empty()).then_some(Completion { start, items, selected: 0 })
+    }
+
+    /// Suggestions while a slash command name is being typed.
+    fn command_completion(&self, channel: Id, typed: &str, cx: &App) -> Option<Completion> {
+        let commands = self.store.read(cx).commands_for(channel)?;
+        let needle = typed.trim_end().to_lowercase();
+        // Once a full command name is followed by a space the user is typing arguments.
+        let in_arguments = typed.ends_with(' ')
+            || commands.iter().any(|c| typed.to_lowercase().starts_with(&format!("{} ", c.full_name())));
+        let mut matches: Vec<_> = commands
+            .iter()
+            .filter(|c| {
+                let name = c.full_name();
+                if in_arguments { name.starts_with(&needle) && name != needle } else { name.contains(&needle) }
+            })
+            .collect();
+        matches.sort_by_key(|c| (!c.full_name().starts_with(&needle), c.full_name()));
+        let items: Vec<_> = matches
+            .into_iter()
+            .take(8)
+            .map(|command| {
+                let name = format!("/{}", command.full_name());
+                let usage = command.usage();
+                CompletionItem {
+                    visual: Visual::Icon(IconName::SquareTerminal),
+                    label: if usage.is_empty() { name.clone() } else { format!("{name} {usage}") },
+                    detail: format!("{} \u{00b7} {}", command.description, command.app_name),
+                    shown: name.clone(),
+                    wire: name,
+                }
+            })
+            .collect();
+        (!items.is_empty()).then_some(Completion { start: 0, items, selected: 0 })
+    }
+
+    /// Runs the composer text as a slash command if it names one.
+    /// Returns `None` when the text is not a known command.
+    fn try_command(&mut self, channel: Id, content: &str, cx: &mut Context<Self>) -> Option<bool> {
+        let typed = content.strip_prefix('/')?;
+        let commands = self.store.read(cx).commands_for(channel)?;
+        let command = commands
+            .iter()
+            .filter(|c| {
+                let name = c.full_name();
+                typed == name || typed.starts_with(&format!("{name} "))
+            })
+            .max_by_key(|c| c.full_name().len())?
+            .clone();
+        let args = typed[command.full_name().len()..].to_string();
+        Some(self.store.update(cx, |store, cx| store.run_command(channel, &command, &args, cx)))
     }
 
     fn accept_completion(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1470,6 +1543,11 @@ impl ChatView {
                     .child("Forwarded"),
             );
             quoted = quoted.children(rich::render_doc(&doc, true, None, mono.clone()));
+            if inner.content.is_empty() && inner.attachments.is_empty() && inner.embeds.is_empty() {
+                quoted = quoted.child(
+                    div().text_color(theme::text_muted()).child("This message has no text to show."),
+                );
+            }
             for (j, attachment) in inner.attachments.iter().enumerate() {
                 quoted = quoted.child(render_attachment(1000 + i * 100 + j, attachment, opener.clone()));
             }
@@ -1589,6 +1667,23 @@ impl ChatView {
                 .child(div().flex_1().min_w_0().truncate().child(what))
         });
 
+        let used = m.interaction.as_ref().map(|interaction| {
+            h_flex()
+                .pl(px(52.))
+                .gap_1()
+                .text_size(px(12.))
+                .text_color(theme::text_muted())
+                .child(icon(IconName::SquareTerminal, 12., theme::text_muted()))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(store.display_name(guild, &interaction.user)),
+                )
+                .child("used")
+                .child(div().text_color(theme::accent_text()).child(format!("/{}", interaction.name)))
+        });
+
         // ---- hover toolbar
         let can_delete = mine || store.can_manage_messages(channel_id);
         let toolbar = (!msg.pending).then(|| {
@@ -1682,6 +1777,10 @@ impl ChatView {
                         });
                     }));
                 }
+                let entity = this.clone();
+                menu = menu.item(PopupMenuItem::new("Forward\u{2026}").on_click(move |_, _, cx| {
+                    entity.update(cx, |_, cx| cx.emit(ChatEvent::Forward { channel: channel_id, message: id }));
+                }));
                 if in_guild && !is_thread_channel {
                     let entity = this.clone();
                     let name = thread_name.clone();
@@ -1747,6 +1846,7 @@ impl ChatView {
             })
             .when(highlighted, |d| d.bg(theme::accent().opacity(0.10)))
             .hover(|s| s.bg(theme::bg_hover()))
+            .children(used)
             .children(reply)
             .child(h_flex().items_start().gap_3().child(gutter).child(body))
             .children(toolbar)

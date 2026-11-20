@@ -6,7 +6,9 @@
 
 use crate::discord::{
     self, Channel, Emoji, Gif, Guild, Id, Member, Message, Reaction, Status, StickerItem, User, channel_kind,
+    commands::{self, SlashCommand},
     gateway::{self, Command, Event},
+    proto::Folder,
     permissions,
     rest::{Rest, Upload},
 };
@@ -57,6 +59,10 @@ pub enum StoreEvent {
     Typing(Id),
     Members(Id),
     Friends,
+    /// The slash command list for a server or conversation arrived.
+    Commands,
+    /// An informational toast.
+    Notice(String),
     /// Text to place on the clipboard, with a confirmation to show.
     Clipboard { text: String, notice: String },
     /// Someone mentioned or messaged the user in a channel that is not open.
@@ -162,6 +168,10 @@ pub struct Store {
     pub muted: std::collections::HashSet<Id>,
     /// The friends page is showing instead of a conversation.
     pub show_friends: bool,
+    /// Slash commands, keyed by server id (or channel id for conversations).
+    slash_commands: HashMap<Id, Rc<Vec<SlashCommand>>>,
+    pub folders: Vec<Folder>,
+    pub collapsed_folders: std::collections::HashSet<i64>,
     forums_loaded: std::collections::HashSet<Id>,
 
     /// `None` is the direct-messages view.
@@ -223,6 +233,9 @@ impl Store {
             relationships: Vec::new(),
             muted: crate::settings::Settings::load().muted.into_iter().map(Id).collect(),
             show_friends: false,
+            slash_commands: HashMap::new(),
+            folders: Vec::new(),
+            collapsed_folders: Default::default(),
             forums_loaded: Default::default(),
             selected_guild: None,
             selected_channel: None,
@@ -885,6 +898,136 @@ impl Store {
                 store.adopt_thread(thread, forum, cx);
             }
         });
+    }
+
+    // ---------------------------------------------------------------- slash commands and forwarding
+
+    fn command_scope(&self, channel: Id) -> Id {
+        self.channels.get(&channel).and_then(|c| c.guild_id).unwrap_or(channel)
+    }
+
+    pub fn commands_for(&self, channel: Id) -> Option<Rc<Vec<SlashCommand>>> {
+        self.slash_commands.get(&self.command_scope(channel)).cloned()
+    }
+
+    /// Fetches the slash commands usable in `channel`, once per server.
+    pub fn load_commands(&mut self, channel: Id, cx: &mut Context<Self>) {
+        let scope = self.command_scope(channel);
+        if self.slash_commands.contains_key(&scope) {
+            return;
+        }
+        // Reserve the slot so that typing does not start several fetches.
+        self.slash_commands.insert(scope, Rc::new(Vec::new()));
+        if self.demo {
+            let sample = serde_json::json!({
+                "applications": [{ "id": "5", "name": "BuildBot" }],
+                "application_commands": [
+                    { "id": "9001", "application_id": "5", "version": "1", "type": 1, "name": "deploy",
+                      "description": "Deploy a branch", "options": [
+                        { "type": 3, "name": "branch", "description": "", "required": true },
+                        { "type": 5, "name": "force", "description": "" },
+                    ]},
+                    { "id": "9002", "application_id": "5", "version": "1", "type": 1, "name": "status",
+                      "description": "Show build status", "options": [] },
+                ],
+            });
+            self.slash_commands.insert(scope, Rc::new(commands::parse_index(&sample)));
+            cx.emit(StoreEvent::Commands);
+            return;
+        }
+        let Some(rest) = self.rest.clone().filter(|r| !r.is_bot()) else { return };
+        let guild = self.channels.get(&channel).and_then(|c| c.guild_id);
+        self.run(cx, async move { rest.command_index(guild, channel).await }, move |store, result, cx| {
+            match result {
+                Ok(index) => {
+                    store.slash_commands.insert(scope, Rc::new(commands::parse_index(&index)));
+                    cx.emit(StoreEvent::Commands);
+                }
+                Err(e) => {
+                    // Allow a later retry.
+                    store.slash_commands.remove(&scope);
+                    log::warn!("could not load slash commands: {e}");
+                }
+            }
+        });
+    }
+
+    /// Runs a slash command. Returns false if the arguments were rejected, so
+    /// the caller can leave the text in place for the user to fix.
+    pub fn run_command(&mut self, channel: Id, command: &SlashCommand, args: &str, cx: &mut Context<Self>) -> bool {
+        let data = match commands::interaction_data(command, args) {
+            Ok(data) => data,
+            Err(reason) => {
+                cx.emit(StoreEvent::Error(reason));
+                return false;
+            }
+        };
+        if self.demo {
+            cx.emit(StoreEvent::Notice(format!("/{} was accepted. Demo mode does not run commands.", command.full_name())));
+            return true;
+        }
+        let Some(rest) = self.rest.clone() else { return false };
+        let guild = self.channels.get(&channel).and_then(|c| c.guild_id);
+        let payload = serde_json::json!({
+            "type": 2,
+            "application_id": command.application_id.to_string(),
+            "guild_id": guild.map(|g| g.to_string()),
+            "channel_id": channel.to_string(),
+            "session_id": self.gateway_session,
+            "nonce": Id::now().to_string(),
+            "data": data,
+        });
+        self.run(cx, async move { rest.interact(payload).await }, |store, result, cx| {
+            store.report(result, "The command failed", cx);
+        });
+        true
+    }
+
+    pub fn forward_message(&mut self, target: Id, source: Id, message: Id, cx: &mut Context<Self>) {
+        let original = self.messages.get(&source).and_then(|e| e.list.iter().find(|m| m.m.id == message)).cloned();
+        let notice = self.channels.get(&target).map(|c| format!("Forwarded to {}.", self.channel_title(c)));
+        if self.demo {
+            let (Some(original), Some(me)) = (original, self.me.clone()) else { return };
+            let snapshot = discord::Snapshot {
+                message: discord::SnapshotMessage {
+                    content: original.m.content.clone(),
+                    attachments: original.m.attachments.clone(),
+                    embeds: original.m.embeds.clone(),
+                },
+            };
+            let local = Message {
+                id: Id::now(),
+                channel_id: target,
+                author: me,
+                message_snapshots: vec![snapshot],
+                ..Default::default()
+            };
+            let msg = self.make_msg(local);
+            self.messages.entry(target).or_default().list.push(msg);
+            cx.emit(StoreEvent::Messages { channel: target, change: MessageChange::Appended(1) });
+            cx.emit(StoreEvent::Notice(notice.unwrap_or_default()));
+            return;
+        }
+        let Some(rest) = self.rest.clone() else { return };
+        let guild = self.channels.get(&source).and_then(|c| c.guild_id);
+        let nonce = Id::now();
+        self.run(
+            cx,
+            async move { rest.forward(target, source, message, guild, nonce).await },
+            move |store, result, cx| {
+                if let Some(sent) = store.report(result, "Could not forward message", cx) {
+                    store.insert_message(sent, Some(nonce), cx);
+                    cx.emit(StoreEvent::Notice(notice.unwrap_or_default()));
+                }
+            },
+        );
+    }
+
+    pub fn toggle_folder(&mut self, folder: i64, cx: &mut Context<Self>) {
+        if !self.collapsed_folders.remove(&folder) {
+            self.collapsed_folders.insert(folder);
+        }
+        cx.emit(StoreEvent::Guilds);
     }
 
     // ---------------------------------------------------------------- GIFs and stickers
@@ -1833,6 +1976,13 @@ impl Store {
             let own = roles.remove(&guild.id);
             self.add_guild(guild, own);
         }
+        // Servers the user has not arranged yet sit at the top, as in Discord.
+        let order: Vec<Id> = ready.folders.iter().flat_map(|f| f.guilds.iter().copied()).collect();
+        if !order.is_empty() {
+            self.guilds.sort_by_key(|g| order.iter().position(|id| *id == g.guild.id).map_or(-1, |p| p as i64));
+        }
+        self.folders = ready.folders.into_iter().filter(|f| f.id.is_some()).collect();
+        self.slash_commands.clear();
         for channel in ready.private_channels {
             for user in &channel.recipients {
                 self.users.entry(user.id).or_insert_with(|| user.clone());
