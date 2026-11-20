@@ -3,9 +3,10 @@
 use super::{form, theme, widgets::*};
 use crate::{
     discord::{
-        Ban, Id,
+        Ban, Id, Webhook,
         audit::{self, TargetKind},
         permissions as p,
+        rest::Upload,
     },
     store::{AuditLog, Store, StoreEvent, image_mime},
 };
@@ -21,6 +22,9 @@ pub enum ServerSettingsEvent {
 enum Tab {
     Overview,
     Roles,
+    Emoji,
+    Stickers,
+    Webhooks,
     Bans,
     AuditLog,
 }
@@ -76,6 +80,7 @@ pub struct ServerSettings {
     hoist: bool,
     bans: Option<Vec<Ban>>,
     audit: Option<AuditLog>,
+    webhooks: Option<Vec<Webhook>>,
     _subs: Vec<Subscription>,
 }
 
@@ -108,6 +113,7 @@ impl ServerSettings {
             hoist: false,
             bans: None,
             audit: None,
+            webhooks: None,
             _subs: subs,
         }
     }
@@ -127,6 +133,18 @@ impl ServerSettings {
 
     fn open_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
         self.tab = tab;
+        if tab == Tab::Webhooks && self.webhooks.is_none() && self.store.read(cx).can(self.guild, MANAGE_WEBHOOKS) {
+            let this = cx.weak_entity();
+            let guild = self.guild;
+            self.store.update(cx, |store, cx| {
+                store.fetch_webhooks(guild, cx, move |hooks, cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        this.webhooks = Some(hooks);
+                        cx.notify();
+                    });
+                });
+            });
+        }
         if tab == Tab::AuditLog && self.audit.is_none() {
             let this = cx.weak_entity();
             let guild = self.guild;
@@ -573,6 +591,302 @@ impl ServerSettings {
     }
 }
 
+
+// ---------------------------------------------------------------- emoji, stickers and webhooks
+
+const MANAGE_EXPRESSIONS: u64 = 1 << 30;
+const MANAGE_WEBHOOKS: u64 = 1 << 29;
+
+/// Asks for an image file and hands its name and bytes to `then`.
+fn pick_image(
+    prompt: &'static str,
+    cx: &mut App,
+    then: impl FnOnce(String, Vec<u8>, &mut App) + 'static,
+) {
+    let picked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some(prompt.into()) });
+    cx.spawn(async move |cx| {
+        let Ok(Ok(Some(paths))) = picked.await else { return };
+        let Some(path) = paths.into_iter().next() else { return };
+        let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        let bytes = cx.background_executor().spawn(async move { std::fs::read(path) }).await;
+        let _ = cx.update(|cx| match bytes {
+            Ok(bytes) => then(name, bytes, cx),
+            Err(e) => log::warn!("could not read the image: {e}"),
+        });
+    })
+    .detach();
+}
+
+/// Discord emoji names: 2-32 letters, digits or underscores.
+fn emoji_name(raw: &str) -> String {
+    let mut name: String = raw.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(32).collect();
+    while name.len() < 2 {
+        name.push('_');
+    }
+    name
+}
+
+impl ServerSettings {
+    fn item_row(id: impl Into<ElementId>) -> Stateful<Div> {
+        h_flex().id(id).px_2().py_1p5().gap_3().rounded_md().hover(|s| s.bg(theme::bg_hover()))
+    }
+
+    fn render_emoji(&self, cx: &mut Context<Self>) -> AnyElement {
+        let store = self.store.read(cx);
+        let can = store.can(self.guild, MANAGE_EXPRESSIONS);
+        let emojis = store.guild(self.guild).map(|g| g.guild.emojis.clone()).unwrap_or_default();
+        v_flex()
+            .gap_1()
+            .child(div().pb_1().text_size(px(12.)).text_color(theme::text_muted()).child(
+                "PNG, JPEG, GIF or WebP, at most 256 KB. The file name becomes the emoji name.",
+            ))
+            .when(can, |d| {
+                d.child(Self::button("emoji-upload", "Upload Emoji", true).mb_2().w(px(140.)).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        let (store, guild) = (this.store.clone(), this.guild);
+                        pick_image("Choose emoji image", cx, move |name, bytes, cx| {
+                            store.update(cx, |s, cx| match image_mime(&bytes) {
+                                Some(mime) => s.create_emoji(guild, emoji_name(&name), mime.to_string(), bytes, cx),
+                                None => cx.emit(StoreEvent::Error("Choose a PNG, JPEG, GIF or WebP image.".into())),
+                            });
+                        });
+                    },
+                )))
+            })
+            .when(emojis.is_empty(), |d| d.child(div().text_color(theme::text_muted()).child("No custom emoji yet.")))
+            .children(emojis.into_iter().filter_map(|emoji| {
+                let id = emoji.id?;
+                let name = emoji.name.clone().unwrap_or_default();
+                let url = emoji.image_url(64).unwrap_or_default();
+                Some(
+                    Self::item_row(("emoji", id.0))
+                        .child(img(url).size(px(28.)).object_fit(ObjectFit::Contain))
+                        .child(div().flex_1().min_w_0().truncate().text_color(theme::text_bright()).child(format!(":{name}:")))
+                        .when(can, |d| {
+                            d.child(Self::button(("emoji-rename", id.0), "Rename", false).on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    let (store, guild) = (this.store.clone(), this.guild);
+                                    let spec = form::FormSpec::new("Rename Emoji", "Save", move |r, _, cx| {
+                                        let name = emoji_name(&r.values[0]);
+                                        store.update(cx, |s, cx| s.rename_emoji(guild, id, name, cx));
+                                    })
+                                    .field(form::Field::new("Name", name.clone()));
+                                    form::open_form(spec, window, cx);
+                                },
+                            )))
+                            .child(Self::button(("emoji-delete", id.0), "Delete", false).on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    let (store, guild) = (this.store.clone(), this.guild);
+                                    form::confirm(window, cx, "Delete emoji?", "It disappears from every message that uses it.", "Delete", move |cx| {
+                                        store.update(cx, |s, cx| s.delete_emoji(guild, id, cx));
+                                    });
+                                },
+                            )))
+                        }),
+                )
+            }))
+            .into_any_element()
+    }
+
+    fn render_stickers(&self, cx: &mut Context<Self>) -> AnyElement {
+        let store = self.store.read(cx);
+        let can = store.can(self.guild, MANAGE_EXPRESSIONS);
+        let stickers = store.guild(self.guild).map(|g| g.guild.stickers.clone()).unwrap_or_default();
+        v_flex()
+            .gap_1()
+            .child(div().pb_1().text_size(px(12.)).text_color(theme::text_muted()).child(
+                "PNG, APNG or GIF, 320 \u{d7} 320 pixels, at most 512 KB.",
+            ))
+            .when(can, |d| {
+                d.child(Self::button("sticker-upload", "Upload Sticker", true).mb_2().w(px(140.)).on_click(cx.listener(
+                    |this, _, window, cx| {
+                        let (store, guild) = (this.store.clone(), this.guild);
+                        let spec = form::FormSpec::new("Upload Sticker", "Choose File", move |r, _, cx| {
+                            let name = r.values[0].clone();
+                            let tags = if r.values[1].is_empty() { "\u{2b50}".to_string() } else { r.values[1].clone() };
+                            if name.len() < 2 {
+                                return;
+                            }
+                            pick_image("Choose sticker image", cx, move |file, bytes, cx| {
+                                store.update(cx, |s, cx| match image_mime(&bytes) {
+                                    Some("image/png" | "image/gif") => {
+                                        let ext = if image_mime(&bytes) == Some("image/gif") { "gif" } else { "png" };
+                                        let upload = Upload { filename: format!("{file}.{ext}"), bytes };
+                                        s.create_sticker(guild, name, tags, upload, cx);
+                                    }
+                                    _ => cx.emit(StoreEvent::Error("Stickers must be PNG, APNG or GIF images.".into())),
+                                });
+                            });
+                        })
+                        .description("Name the sticker and pick the emoji it is suggested for, then choose the file.")
+                        .field(form::Field::new("Name", "").placeholder("Ferris wave"))
+                        .field(form::Field::new("Related emoji", "").placeholder("\u{2b50}"));
+                        form::open_form(spec, window, cx);
+                    },
+                )))
+            })
+            .when(stickers.is_empty(), |d| d.child(div().text_color(theme::text_muted()).child("No stickers yet.")))
+            .children(stickers.into_iter().map(|sticker| {
+                let id = sticker.id;
+                let name = sticker.name.clone();
+                Self::item_row(("sticker", id.0))
+                    .child(match sticker.image_url() {
+                        Some(url) => img(url).size(px(40.)).object_fit(ObjectFit::Contain).into_any_element(),
+                        None => div().size(px(40.)).into_any_element(),
+                    })
+                    .child(div().flex_1().min_w_0().truncate().text_color(theme::text_bright()).child(name.clone()))
+                    .when(can, |d| {
+                        d.child(Self::button(("sticker-rename", id.0), "Rename", false).on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                let (store, guild) = (this.store.clone(), this.guild);
+                                let spec = form::FormSpec::new("Rename Sticker", "Save", move |r, _, cx| {
+                                    let name = r.values[0].clone();
+                                    if name.len() >= 2 {
+                                        store.update(cx, |s, cx| s.rename_sticker(guild, id, name, cx));
+                                    }
+                                })
+                                .field(form::Field::new("Name", name.clone()));
+                                form::open_form(spec, window, cx);
+                            },
+                        )))
+                        .child(Self::button(("sticker-delete", id.0), "Delete", false).on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                let (store, guild) = (this.store.clone(), this.guild);
+                                form::confirm(window, cx, "Delete sticker?", "This cannot be undone.", "Delete", move |cx| {
+                                    store.update(cx, |s, cx| s.delete_sticker(guild, id, cx));
+                                });
+                            },
+                        )))
+                    })
+            }))
+            .into_any_element()
+    }
+
+    /// The server's text channels, for choosing where a webhook posts.
+    fn text_channels(&self, cx: &App) -> Vec<(Id, String)> {
+        let store = self.store.read(cx);
+        let mut channels: Vec<_> = store
+            .channels
+            .values()
+            .filter(|c| c.guild_id == Some(self.guild) && (c.kind == 0 || c.kind == 5))
+            .map(|c| (c.id, c.name.clone().unwrap_or_default()))
+            .collect();
+        channels.sort_by(|a, b| a.1.cmp(&b.1));
+        channels
+    }
+
+    fn set_webhook(&mut self, hook: Webhook, cx: &mut Context<Self>) {
+        let list = self.webhooks.get_or_insert_with(Vec::new);
+        match list.iter_mut().find(|h| h.id == hook.id) {
+            Some(existing) => *existing = hook,
+            None => list.push(hook),
+        }
+        cx.notify();
+    }
+
+    /// A form for a new webhook (`hook` is `None`) or for renaming or moving one.
+    fn webhook_form(&mut self, hook: Option<Webhook>, window: &mut Window, cx: &mut Context<Self>) {
+        let channels = self.text_channels(cx);
+        if channels.is_empty() {
+            return;
+        }
+        let selected = hook
+            .as_ref()
+            .and_then(|h| channels.iter().position(|(id, _)| Some(*id) == h.channel_id))
+            .unwrap_or(0);
+        let labels: Vec<String> = channels.iter().map(|(_, n)| format!("#{n}")).collect();
+        let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let (store, this) = (self.store.clone(), cx.weak_entity());
+        let editing = hook.as_ref().map(|h| h.id);
+        let spec = form::FormSpec::new(if editing.is_some() { "Edit Webhook" } else { "Create Webhook" }, "Save", move |r, _, cx| {
+            let name = r.values[0].clone();
+            let Some((channel, _)) = channels.get(r.choice).cloned() else { return };
+            if name.is_empty() {
+                return;
+            }
+            let done = move |hook: Webhook, cx: &mut App| {
+                let _ = this.update(cx, |this, cx| this.set_webhook(hook, cx));
+            };
+            store.update(cx, |s, cx| match editing {
+                Some(id) => s.edit_webhook(id, name, channel, cx, done),
+                None => s.create_webhook(channel, name, cx, done),
+            });
+        })
+        .field(form::Field::new("Name", hook.and_then(|h| h.name).unwrap_or_else(|| "Webhook".into())))
+        .choice("Channel", &label_refs, selected);
+        form::open_form(spec, window, cx);
+    }
+
+    fn render_webhooks(&self, cx: &mut Context<Self>) -> AnyElement {
+        let can = self.store.read(cx).can(self.guild, MANAGE_WEBHOOKS);
+        if !can {
+            return div().text_color(theme::text_muted()).child("You need Manage Webhooks to see this.").into_any_element();
+        }
+        let Some(hooks) = self.webhooks.clone() else {
+            return div().text_color(theme::text_muted()).child("Loading webhooks\u{2026}").into_any_element();
+        };
+        let channel_name = |id: Option<Id>| {
+            id.and_then(|id| self.store.read(cx).channels.get(&id).and_then(|c| c.name.clone()))
+                .map_or_else(|| "unknown channel".into(), |n| format!("#{n}"))
+        };
+        let rows: Vec<_> = hooks.iter().map(|h| (h.clone(), channel_name(h.channel_id))).collect();
+        v_flex()
+            .gap_1()
+            .child(div().pb_1().text_size(px(12.)).text_color(theme::text_muted()).child(
+                "Apps and services post to a channel through a webhook address. Treat the address like a password.",
+            ))
+            .child(Self::button("webhook-create", "Create Webhook", true).mb_2().w(px(150.)).on_click(cx.listener(
+                |this, _, window, cx| this.webhook_form(None, window, cx),
+            )))
+            .when(rows.is_empty(), |d| d.child(div().text_color(theme::text_muted()).child("No webhooks yet.")))
+            .children(rows.into_iter().map(|(hook, channel)| {
+                let id = hook.id;
+                let url = hook.url();
+                let edit = hook.clone();
+                Self::item_row(("webhook", id.0))
+                    .child(avatar(hook.avatar_url().unwrap_or_default(), 28.))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().truncate().text_color(theme::text_bright()).child(hook.name.clone().unwrap_or_default()))
+                            .child(div().text_size(px(12.)).text_color(theme::text_muted()).child(format!("Posts to {channel}"))),
+                    )
+                    .when_some(url, |d, url| {
+                        d.child(Self::button(("webhook-copy", id.0), "Copy URL", false).on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                let text = url.clone();
+                                this.store.update(cx, |_, cx| {
+                                    cx.emit(StoreEvent::Clipboard { text, notice: "Webhook URL copied.".into() })
+                                });
+                            },
+                        )))
+                    })
+                    .child(Self::button(("webhook-edit", id.0), "Edit", false).on_click(cx.listener(
+                        move |this, _, window, cx| this.webhook_form(Some(edit.clone()), window, cx),
+                    )))
+                    .child(Self::button(("webhook-delete", id.0), "Delete", false).on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            let (store, this_entity) = (this.store.clone(), cx.weak_entity());
+                            form::confirm(window, cx, "Delete webhook?", "Anything posting to it will stop working.", "Delete", move |cx| {
+                                store.update(cx, |s, cx| {
+                                    s.delete_webhook(id, cx, move |cx| {
+                                        let _ = this_entity.update(cx, |this, cx| {
+                                            if let Some(list) = this.webhooks.as_mut() {
+                                                list.retain(|h| h.id != id);
+                                            }
+                                            cx.notify();
+                                        });
+                                    });
+                                });
+                            });
+                        },
+                    )))
+            }))
+            .into_any_element()
+    }
+}
+
 /// The preset colours, plus the role's own colour if it is not one of them.
 fn swatches(current: u32) -> Vec<u32> {
     let mut colors = ROLE_COLORS.to_vec();
@@ -600,11 +914,21 @@ impl Render for ServerSettings {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let name = self.store.read(cx).guild(self.guild).map(|g| g.guild.name.clone()).unwrap_or_default();
         let tab = self.tab;
-        let tabs =
-            [("Overview", Tab::Overview), ("Roles", Tab::Roles), ("Bans", Tab::Bans), ("Audit Log", Tab::AuditLog)];
+        let tabs = [
+            ("Overview", Tab::Overview),
+            ("Roles", Tab::Roles),
+            ("Emoji", Tab::Emoji),
+            ("Stickers", Tab::Stickers),
+            ("Webhooks", Tab::Webhooks),
+            ("Bans", Tab::Bans),
+            ("Audit Log", Tab::AuditLog),
+        ];
         let body = match tab {
             Tab::Overview => self.render_overview(cx),
             Tab::Roles => self.render_roles(cx),
+            Tab::Emoji => self.render_emoji(cx),
+            Tab::Stickers => self.render_stickers(cx),
+            Tab::Webhooks => self.render_webhooks(cx),
             Tab::Bans => self.render_bans(cx),
             Tab::AuditLog => self.render_audit(cx),
         };
@@ -621,7 +945,7 @@ impl Render for ServerSettings {
             .child(
                 v_flex()
                     .id("server-settings")
-                    .w(px(760.))
+                    .w(px(860.))
                     .max_h(px(640.))
                     .p_5()
                     .gap_3()
@@ -647,7 +971,7 @@ impl Render for ServerSettings {
                             .children(tabs.into_iter().enumerate().map(|(ix, (label, value))| {
                                 div()
                                     .id(("server-tab", ix))
-                                    .px_3()
+                                    .px_2()
                                     .py_1()
                                     .rounded_md()
                                     .cursor_pointer()

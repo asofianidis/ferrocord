@@ -516,7 +516,7 @@ fn channel_admin_items(
     let noun = if is_category { "Category" } else { "Channel" };
     menu.separator()
         .when(can_override, |m| {
-            m.item(PopupMenuItem::new("Permissions").on_click(move |_, _, cx| form::open_channel_permissions(id, cx)))
+            m.item(PopupMenuItem::new("Permissions").on_click(move |_, window, cx| form::open_channel_permissions(id, window, cx)))
         })
         .item(PopupMenuItem::new(format!("Edit {noun}")).on_click(move |_, window, cx| {
             let Some(channel) = edit.read(cx).channels.get(&id).cloned() else { return };

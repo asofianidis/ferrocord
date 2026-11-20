@@ -341,6 +341,32 @@ pub struct Guild {
     pub stage_instances: Vec<StageInstance>,
 }
 
+/// A webhook: an address apps can post messages to.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Webhook {
+    pub id: Id,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub channel_id: Option<Id>,
+    /// Only present for incoming webhooks you can manage.
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub avatar: Option<String>,
+}
+
+impl Webhook {
+    /// The address to post to, which works as a password: anyone with it can post.
+    pub fn url(&self) -> Option<String> {
+        self.token.as_ref().map(|t| format!("https://discord.com/api/webhooks/{}/{t}", self.id))
+    }
+
+    pub fn avatar_url(&self) -> Option<String> {
+        self.avatar.as_ref().map(|hash| format!("{CDN}/avatars/{}/{hash}.png?size=64", self.id))
+    }
+}
+
 /// A GIF search result.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Gif {

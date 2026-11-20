@@ -156,8 +156,8 @@ impl AppView {
         cx.notify();
     }
 
-    pub fn show_channel_permissions(&mut self, channel: crate::discord::Id, cx: &mut Context<Self>) {
-        let view = cx.new(|cx| channel_permissions::ChannelPermissions::new(self.store.clone(), channel, cx));
+    pub fn show_channel_permissions(&mut self, channel: crate::discord::Id, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.new(|cx| channel_permissions::ChannelPermissions::new(self.store.clone(), channel, window, cx));
         self._channel_permissions_sub =
             Some(cx.subscribe(&view, |this, _, _: &channel_permissions::ChannelPermissionsEvent, cx| {
                 this.channel_permissions = None;

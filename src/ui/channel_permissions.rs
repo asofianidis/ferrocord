@@ -7,6 +7,7 @@ use crate::{
     store::{Store, StoreEvent},
 };
 use gpui::{prelude::*, *};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_kit::assets::IconName;
 
 pub enum ChannelPermissionsEvent {
@@ -30,20 +31,26 @@ pub struct ChannelPermissions {
     channel: Id,
     /// The role or member being edited, with its unsaved allow and deny bits.
     editing: Option<Overwrite>,
+    /// Search box for adding a member override.
+    member_search: Entity<InputState>,
     _subs: Vec<Subscription>,
 }
 
 impl EventEmitter<ChannelPermissionsEvent> for ChannelPermissions {}
 
 impl ChannelPermissions {
-    pub fn new(store: Entity<Store>, channel: Id, cx: &mut Context<Self>) -> Self {
-        let subs = vec![cx.subscribe(&store, move |this, store, event: &StoreEvent, cx| {
-            if matches!(event, StoreEvent::Channels) && !store.read(cx).channels.contains_key(&this.channel) {
-                cx.emit(ChannelPermissionsEvent::Close);
-            }
-            cx.notify();
-        })];
-        let mut this = Self { store, channel, editing: None, _subs: subs };
+    pub fn new(store: Entity<Store>, channel: Id, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let member_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search members"));
+        let subs = vec![
+            cx.subscribe(&store, move |this, store, event: &StoreEvent, cx| {
+                if matches!(event, StoreEvent::Channels) && !store.read(cx).channels.contains_key(&this.channel) {
+                    cx.emit(ChannelPermissionsEvent::Close);
+                }
+                cx.notify();
+            }),
+            cx.subscribe(&member_search, |_, _, _: &InputEvent, cx| cx.notify()),
+        ];
+        let mut this = Self { store, channel, editing: None, member_search, _subs: subs };
         // Start on @everyone, which every channel can override.
         if let Some(guild) = this.guild(cx) {
             this.select(guild, 0, cx);
@@ -120,6 +127,18 @@ impl ChannelPermissions {
         // Roles that could get an override.
         let addable: Vec<(Id, String)> =
             store.ordered_roles(guild).into_iter().filter(|r| !has(r.id)).map(|r| (r.id, r.name)).collect();
+        let query = self.member_search.read(cx).value().trim().to_string();
+        let members: Vec<(Id, String)> = if query.is_empty() {
+            Vec::new()
+        } else {
+            store
+                .mention_candidates(self.channel, &query, 8)
+                .into_iter()
+                .filter(|(u, _)| !has(u.id))
+                .map(|(u, name)| (u.id, name))
+                .take(5)
+                .collect()
+        };
 
         v_flex()
             .id("override-targets")
@@ -146,6 +165,15 @@ impl ChannelPermissions {
                             .on_click(cx.listener(move |this, _, _, cx| this.select(id, 0, cx)))
                     }))
             })
+            .child(div().pt_3().pb_1().text_size(px(12.)).text_color(theme::text_muted()).child("ADD A MEMBER"))
+            .child(Input::new(&self.member_search))
+            .children(members.into_iter().map(|(id, name)| {
+                Self::row(("add-member-override", id.0), selected == Some(id))
+                    .text_color(theme::text_muted())
+                    .child(icon(IconName::Plus, 14., theme::text_muted()))
+                    .child(div().min_w_0().truncate().child(name))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select(id, 1, cx)))
+            }))
             .into_any_element()
     }
 

@@ -89,6 +89,9 @@ pub enum Event {
     MemberRemove { guild_id: Id, user_id: Id },
     /// The account's own user object changed.
     UserUpdate(Box<User>),
+    /// A server's custom emoji or stickers were replaced.
+    Emojis { guild_id: Id, emojis: Vec<Emoji> },
+    Stickers { guild_id: Id, stickers: Vec<StickerItem> },
 }
 
 #[derive(Debug)]
@@ -570,6 +573,14 @@ fn dispatch(state: &mut State, kind: &str, mut d: Value) -> Vec<Event> {
             let Some(guild_id) = id_of(&d["guild_id"]) else { return vec![] };
             one(parse::<Role>(d["role"].take(), kind).map(|role| Event::RoleUpsert { guild_id, role }))
         }
+        "GUILD_EMOJIS_UPDATE" => match (id_of(&d["guild_id"]), serde_json::from_value(d["emojis"].clone())) {
+            (Some(guild_id), Ok(emojis)) => vec![Event::Emojis { guild_id, emojis }],
+            _ => vec![],
+        },
+        "GUILD_STICKERS_UPDATE" => match (id_of(&d["guild_id"]), serde_json::from_value(d["stickers"].clone())) {
+            (Some(guild_id), Ok(stickers)) => vec![Event::Stickers { guild_id, stickers }],
+            _ => vec![],
+        },
         "GUILD_ROLE_DELETE" => match (id_of(&d["guild_id"]), id_of(&d["role_id"])) {
             (Some(guild_id), Some(role_id)) => vec![Event::RoleDelete { guild_id, role_id }],
             _ => vec![],

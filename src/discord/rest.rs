@@ -1,6 +1,6 @@
 //! Minimal Discord REST client with rate-limit handling.
 
-use super::model::{Ban, Channel, Gif, Id, Message, Role, User};
+use super::model::{Ban, Channel, Emoji, Gif, Id, Message, Role, StickerItem, User, Webhook};
 use anyhow::{Result, anyhow};
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde_json::{Value, json};
@@ -436,6 +436,76 @@ impl Rest {
 
     pub async fn delete_overwrite(&self, channel: Id, target: Id) -> Result<()> {
         let path = format!("/channels/{channel}/permissions/{target}");
+        self.send(|| self.request(Method::DELETE, &path)).await?;
+        Ok(())
+    }
+
+    pub async fn create_emoji(&self, guild: Id, name: &str, image_uri: &str) -> Result<Emoji> {
+        let path = format!("/guilds/{guild}/emojis");
+        let body = json!({ "name": name, "image": image_uri });
+        Ok(self.send(|| self.request(Method::POST, &path).json(&body)).await?.json().await?)
+    }
+
+    pub async fn rename_emoji(&self, guild: Id, emoji: Id, name: &str) -> Result<Emoji> {
+        let path = format!("/guilds/{guild}/emojis/{emoji}");
+        let body = json!({ "name": name });
+        Ok(self.send(|| self.request(Method::PATCH, &path).json(&body)).await?.json().await?)
+    }
+
+    pub async fn delete_emoji(&self, guild: Id, emoji: Id) -> Result<()> {
+        let path = format!("/guilds/{guild}/emojis/{emoji}");
+        self.send(|| self.request(Method::DELETE, &path)).await?;
+        Ok(())
+    }
+
+    /// Uploads a sticker; `tags` is the emoji it is suggested for.
+    pub async fn create_sticker(&self, guild: Id, name: &str, tags: &str, file: Upload) -> Result<StickerItem> {
+        let path = format!("/guilds/{guild}/stickers");
+        let form = reqwest::multipart::Form::new()
+            .text("name", name.to_string())
+            .text("description", String::new())
+            .text("tags", tags.to_string())
+            .part("file", reqwest::multipart::Part::bytes(file.bytes).file_name(file.filename));
+        let resp = self.request(Method::POST, &path).multipart(form).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            let msg = body["message"].as_str().unwrap_or("upload failed");
+            return Err(anyhow!("{msg} (HTTP {})", status.as_u16()));
+        }
+        Ok(resp.json().await?)
+    }
+
+    pub async fn rename_sticker(&self, guild: Id, sticker: Id, name: &str) -> Result<StickerItem> {
+        let path = format!("/guilds/{guild}/stickers/{sticker}");
+        let body = json!({ "name": name });
+        Ok(self.send(|| self.request(Method::PATCH, &path).json(&body)).await?.json().await?)
+    }
+
+    pub async fn delete_sticker(&self, guild: Id, sticker: Id) -> Result<()> {
+        let path = format!("/guilds/{guild}/stickers/{sticker}");
+        self.send(|| self.request(Method::DELETE, &path)).await?;
+        Ok(())
+    }
+
+    pub async fn webhooks(&self, guild: Id) -> Result<Vec<Webhook>> {
+        let path = format!("/guilds/{guild}/webhooks");
+        Ok(self.send(|| self.request(Method::GET, &path)).await?.json().await?)
+    }
+
+    pub async fn create_webhook(&self, channel: Id, name: &str) -> Result<Webhook> {
+        let path = format!("/channels/{channel}/webhooks");
+        let body = json!({ "name": name });
+        Ok(self.send(|| self.request(Method::POST, &path).json(&body)).await?.json().await?)
+    }
+
+    pub async fn modify_webhook(&self, webhook: Id, body: Value) -> Result<Webhook> {
+        let path = format!("/webhooks/{webhook}");
+        Ok(self.send(|| self.request(Method::PATCH, &path).json(&body)).await?.json().await?)
+    }
+
+    pub async fn delete_webhook(&self, webhook: Id) -> Result<()> {
+        let path = format!("/webhooks/{webhook}");
         self.send(|| self.request(Method::DELETE, &path)).await?;
         Ok(())
     }

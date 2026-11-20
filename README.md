@@ -45,7 +45,9 @@ The official client is an Electron app: high memory use, slow startup, and a slu
 - Server settings: name, icon, the ban list with unbanning, and the audit log
 - Create, rename, retopic and delete channels and categories
 - Roles: create, rename, recolour, reorder, show separately in the member list, edit permissions and delete
-- Channel and category permission overrides for any role, and editing existing member overrides
+- Channel and category permission overrides for any role or member
+- Custom emoji and stickers: upload, rename and delete
+- Webhooks: create, rename, move to another channel, copy the address and delete
 - Members: change nicknames, add and remove roles, time out, kick and ban, limited to what your permissions allow
 
 **App**
@@ -60,7 +62,7 @@ Discord only offers some features to user accounts: search, friends, GIF search,
 
 ### Not implemented
 
-Video, camera and screen sharing. Voice is built on songbird, which handles audio only, so video would need its own transport, codecs and DAVE frame encryption. Also not present: adding new member-specific channel overrides, webhooks, custom emoji and sticker management, AutoMod, and server onboarding and events.
+Video, camera and screen sharing. Voice is built on songbird, which handles audio only, so video would need its own transport, codecs and DAVE frame encryption. Also not present: AutoMod, and server onboarding and events.
 
 ### About voice
 

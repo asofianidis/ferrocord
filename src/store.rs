@@ -5,7 +5,7 @@
 //! fine-grained [`StoreEvent`]s so that only the affected view re-renders.
 
 use crate::discord::{
-    self, Ban, Channel, Emoji, Gif, Guild, Id, Member, Message, Overwrite, Reaction, Role, Status, StickerItem, User,
+    self, Ban, Channel, Emoji, Gif, Guild, Id, Member, Message, Overwrite, Reaction, Role, Status, StickerItem, User, Webhook,
     VoiceState, channel_kind,
     commands::{self, SlashCommand},
     gateway::{self, Command, Event},
@@ -1302,6 +1302,158 @@ impl Store {
             return apply(self, (), cx);
         }
         self.admin("Could not remove the override", cx, move |rest| async move { rest.delete_overwrite(channel, target).await }, apply);
+    }
+
+    // ------------------------------------------------------------ expressions
+
+    fn change_expressions(&mut self, guild: Id, cx: &mut Context<Self>, change: impl FnOnce(&mut Guild)) {
+        if let Some(state) = self.guild_mut(guild) {
+            change(&mut state.guild);
+        }
+        cx.emit(StoreEvent::Guilds);
+        cx.notify();
+    }
+
+    /// Adds a custom emoji from image bytes (PNG, JPEG, GIF or WebP, at most 256 KB).
+    pub fn create_emoji(&mut self, guild: Id, name: String, mime: String, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        if bytes.len() > 256 * 1024 {
+            cx.emit(StoreEvent::Error("Emoji images must be 256 KB or smaller.".into()));
+            return;
+        }
+        let apply = move |store: &mut Self, emoji: Emoji, cx: &mut Context<Self>| {
+            store.change_expressions(guild, cx, |g| g.emojis.push(emoji));
+        };
+        if self.demo {
+            let emoji = Emoji { id: Some(Id::now()), name: Some(name), animated: mime == "image/gif" };
+            return apply(self, emoji, cx);
+        }
+        let uri = data_uri(&mime, &bytes);
+        self.admin("Could not add the emoji", cx, move |rest| async move { rest.create_emoji(guild, &name, &uri).await }, apply);
+    }
+
+    pub fn rename_emoji(&mut self, guild: Id, emoji: Id, name: String, cx: &mut Context<Self>) {
+        let apply = move |store: &mut Self, updated: Emoji, cx: &mut Context<Self>| {
+            store.change_expressions(guild, cx, |g| {
+                if let Some(e) = g.emojis.iter_mut().find(|e| e.id == Some(emoji)) {
+                    e.name = updated.name;
+                }
+            });
+        };
+        if self.demo {
+            return apply(self, Emoji { id: Some(emoji), name: Some(name), animated: false }, cx);
+        }
+        self.admin("Could not rename the emoji", cx, move |rest| async move { rest.rename_emoji(guild, emoji, &name).await }, apply);
+    }
+
+    pub fn delete_emoji(&mut self, guild: Id, emoji: Id, cx: &mut Context<Self>) {
+        let apply = move |store: &mut Self, _: (), cx: &mut Context<Self>| {
+            store.change_expressions(guild, cx, |g| g.emojis.retain(|e| e.id != Some(emoji)));
+        };
+        if self.demo {
+            return apply(self, (), cx);
+        }
+        self.admin("Could not delete the emoji", cx, move |rest| async move { rest.delete_emoji(guild, emoji).await }, apply);
+    }
+
+    /// Uploads a sticker (PNG, APNG or GIF, at most 512 KB). `tags` is the
+    /// emoji Discord suggests it for.
+    pub fn create_sticker(&mut self, guild: Id, name: String, tags: String, file: Upload, cx: &mut Context<Self>) {
+        if file.bytes.len() > 512 * 1024 {
+            cx.emit(StoreEvent::Error("Stickers must be 512 KB or smaller.".into()));
+            return;
+        }
+        let apply = move |store: &mut Self, sticker: StickerItem, cx: &mut Context<Self>| {
+            store.change_expressions(guild, cx, |g| g.stickers.push(sticker));
+        };
+        if self.demo {
+            return apply(self, StickerItem { id: Id::now(), name, format_type: 1 }, cx);
+        }
+        self.admin("Could not add the sticker", cx, move |rest| async move { rest.create_sticker(guild, &name, &tags, file).await }, apply);
+    }
+
+    pub fn rename_sticker(&mut self, guild: Id, sticker: Id, name: String, cx: &mut Context<Self>) {
+        let apply = move |store: &mut Self, updated: StickerItem, cx: &mut Context<Self>| {
+            store.change_expressions(guild, cx, |g| {
+                if let Some(s) = g.stickers.iter_mut().find(|s| s.id == sticker) {
+                    s.name = updated.name;
+                }
+            });
+        };
+        if self.demo {
+            return apply(self, StickerItem { id: sticker, name, format_type: 1 }, cx);
+        }
+        self.admin("Could not rename the sticker", cx, move |rest| async move { rest.rename_sticker(guild, sticker, &name).await }, apply);
+    }
+
+    pub fn delete_sticker(&mut self, guild: Id, sticker: Id, cx: &mut Context<Self>) {
+        let apply = move |store: &mut Self, _: (), cx: &mut Context<Self>| {
+            store.change_expressions(guild, cx, |g| g.stickers.retain(|s| s.id != sticker));
+        };
+        if self.demo {
+            return apply(self, (), cx);
+        }
+        self.admin("Could not delete the sticker", cx, move |rest| async move { rest.delete_sticker(guild, sticker).await }, apply);
+    }
+
+    // --------------------------------------------------------------- webhooks
+
+    pub fn fetch_webhooks(&mut self, guild: Id, cx: &mut Context<Self>, then: impl FnOnce(Vec<Webhook>, &mut gpui::App) + 'static) {
+        if self.demo {
+            let channel = self.channels.values().filter(|c| c.guild_id == Some(guild) && c.kind == 0).map(|c| c.id).min();
+            let sample = vec![Webhook {
+                id: Id(4242),
+                name: Some("CI notifications".into()),
+                channel_id: channel,
+                token: Some("demo-token".into()),
+                avatar: None,
+            }];
+            cx.defer(move |cx| then(sample, cx));
+            return;
+        }
+        self.admin("Could not load webhooks", cx, move |rest| async move { rest.webhooks(guild).await }, move |_, hooks, cx| {
+            cx.defer(move |cx| then(hooks, cx));
+        });
+    }
+
+    pub fn create_webhook(&mut self, channel: Id, name: String, cx: &mut Context<Self>, then: impl FnOnce(Webhook, &mut gpui::App) + 'static) {
+        if self.demo {
+            let hook = Webhook { id: Id::now(), name: Some(name), channel_id: Some(channel), token: Some("demo-token".into()), avatar: None };
+            cx.defer(move |cx| then(hook, cx));
+            return;
+        }
+        self.admin("Could not create the webhook", cx, move |rest| async move { rest.create_webhook(channel, &name).await }, move |_, hook, cx| {
+            cx.defer(move |cx| then(hook, cx));
+        });
+    }
+
+    /// Renames a webhook and/or moves it to another channel.
+    pub fn edit_webhook(
+        &mut self,
+        webhook: Id,
+        name: String,
+        channel: Id,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(Webhook, &mut gpui::App) + 'static,
+    ) {
+        if self.demo {
+            let hook = Webhook { id: webhook, name: Some(name), channel_id: Some(channel), token: Some("demo-token".into()), avatar: None };
+            cx.defer(move |cx| then(hook, cx));
+            return;
+        }
+        let body = serde_json::json!({ "name": name, "channel_id": channel.to_string() });
+        self.admin("Could not change the webhook", cx, move |rest| async move { rest.modify_webhook(webhook, body).await }, move |_, hook, cx| {
+            cx.defer(move |cx| then(hook, cx));
+        });
+    }
+
+    pub fn delete_webhook(&mut self, webhook: Id, cx: &mut Context<Self>, then: impl FnOnce(&mut gpui::App) + 'static) {
+        if self.demo {
+            cx.defer(then);
+            return;
+        }
+        self.admin("Could not delete the webhook", cx, move |rest| async move { rest.delete_webhook(webhook).await }, move |_, _, cx| {
+            cx.defer(then);
+        });
     }
 
     /// Loads the most recent audit log entries.
@@ -3025,6 +3177,18 @@ impl Store {
                 }
                 self.member_info.remove(&(guild_id, user_id));
                 cx.emit(StoreEvent::Members(guild_id));
+            }
+            Event::Emojis { guild_id, emojis } => {
+                if let Some(state) = self.guild_mut(guild_id) {
+                    state.guild.emojis = emojis;
+                }
+                cx.emit(StoreEvent::Guilds);
+            }
+            Event::Stickers { guild_id, stickers } => {
+                if let Some(state) = self.guild_mut(guild_id) {
+                    state.guild.stickers = stickers;
+                }
+                cx.emit(StoreEvent::Guilds);
             }
             Event::UserUpdate(user) => {
                 if self.me.as_ref().is_some_and(|me| me.id == user.id) {
