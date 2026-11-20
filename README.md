@@ -100,6 +100,17 @@ To look around without signing in, load offline sample data:
 cargo run -- --demo
 ```
 
+### Windows installer
+
+```sh
+cargo install cargo-packager --locked   # once
+cargo packager --release
+```
+
+This writes `dist/ferrocord_<version>_x64-setup.exe`. It installs for the current user only (no administrator prompt) into `%LOCALAPPDATA%\Ferrocord`, adds Start menu and desktop shortcuts, and appears in Apps & features for uninstalling. Pass `/S` for a silent install. The installer is not code-signed, so Windows SmartScreen warns before running it; choose "More info", then "Run anyway".
+
+The icon is drawn by `assets/make_icon.py`.
+
 ### Shortcuts
 
 | Key | Action |
