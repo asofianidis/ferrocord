@@ -383,6 +383,21 @@ impl Render for SettingsView {
                             ))
                         },
                     )))
+                    .when(cfg!(windows), |d| {
+                        let to_tray = self.saved.close_to_tray;
+                        d.child(Self::section("WHEN YOU CLOSE THE WINDOW"))
+                            .child(h_flex().gap_2().children([(true, "Keep running in the system tray"), (false, "Quit Ferrocord")].into_iter().map(
+                                |(value, label)| {
+                                    Self::pill(SharedString::from(format!("close-{value}")), label, to_tray == value).on_click(
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.saved.close_to_tray = value;
+                                            settings::Settings::update(|s| s.close_to_tray = value);
+                                            cx.notify();
+                                        }),
+                                    )
+                                },
+                            )))
+                    })
                     .child(Self::section("STATUS"))
                     .child(h_flex().gap_2().children(
                         [Status::Online, Status::Idle, Status::Dnd, Status::Offline].into_iter().enumerate().map(

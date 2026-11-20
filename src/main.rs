@@ -7,14 +7,27 @@ mod http;
 mod markdown;
 mod settings;
 mod store;
+mod tray;
 mod voice;
 mod ui;
 
+use futures::StreamExt as _;
 use gpui::{prelude::*, *};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+
+    // The tray icon, its menu and later launches all send commands here.
+    let (tray_tx, mut tray_rx) = futures::channel::mpsc::unbounded::<tray::Command>();
+    let demo = std::env::args().any(|arg| arg.starts_with("--demo"));
+    // Demo mode may run beside a real copy, so it skips the one-copy check.
+    if !demo && !tray::single_instance::claim(tray_tx.clone()) {
+        return; // Another copy is running and has been asked to show itself.
+    }
 
     // Networking runs on Tokio; the UI runs on GPUI's own executor.
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -36,7 +49,7 @@ fn main() {
             ui::theme::apply(palette, cx);
 
             let store = cx.new(|_| store::Store::new(handle.clone()));
-            if std::env::args().any(|arg| arg.starts_with("--demo")) {
+            if demo {
                 store.update(cx, |store, cx| store.load_demo(cx));
             } else if let Some((token, is_bot)) = credentials::load() {
                 store.update(cx, |store, cx| store.login(token, is_bot, cx));
@@ -54,6 +67,37 @@ fn main() {
                     .expect("failed to open the main window");
 
             cx.set_global(ui::form::AppHandle(view.downgrade()));
+
+            // Closing the window hides it to the tray, unless that is turned off
+            // in settings or the tray icon could not be created.
+            let tray = tray::create(tray_tx.clone());
+            let has_tray = tray.is_some();
+            cx.set_global(TrayHolder(tray));
+            let quitting = Arc::new(AtomicBool::new(false));
+            let quitting_check = quitting.clone();
+            let _ = window.update(cx, |_, window, cx| {
+                window.on_window_should_close(cx, move |window, _| {
+                    if has_tray && !quitting_check.load(Ordering::SeqCst) && settings::Settings::load().close_to_tray {
+                        tray::hide(window);
+                        return false;
+                    }
+                    true
+                });
+            });
+            cx.spawn(async move |cx| {
+                while let Some(command) = tray_rx.next().await {
+                    match command {
+                        tray::Command::Show => {
+                            let _ = window.update(cx, |_, window, _| tray::show(window));
+                        }
+                        tray::Command::Quit => {
+                            quitting.store(true, Ordering::SeqCst);
+                            let _ = cx.update(|cx| cx.quit());
+                        }
+                    }
+                }
+            })
+            .detach();
             let settings_view = view.clone();
             // Registered globally so the shortcuts work wherever focus is.
             cx.bind_keys([
@@ -94,3 +138,8 @@ fn main() {
             .detach();
         });
 }
+
+/// Keeps the tray icon alive for as long as the app runs.
+struct TrayHolder(#[allow(dead_code)] Option<tray::Tray>);
+
+impl Global for TrayHolder {}

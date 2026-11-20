@@ -58,6 +58,7 @@ The official client is an Electron app: high memory use, slow startup, and a slu
 - Themes, including your own
 - Leave a server, close a conversation, copy an invite link
 - Automatic reconnect and session resume
+- On Windows, closing the window keeps Ferrocord running in the system tray (click the tray icon to bring it back, or right-click it to quit); Settings can turn this off. Only one copy runs at a time: starting it again shows the running copy
 
 ### Bot accounts versus user accounts
 

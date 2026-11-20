@@ -14,6 +14,8 @@ pub struct Settings {
     pub output_device: Option<String>,
     /// Voice activity threshold in dBFS.
     pub input_sensitivity_db: f32,
+    /// Closing the window keeps the app running in the system tray (Windows).
+    pub close_to_tray: bool,
 }
 
 impl Default for Settings {
@@ -24,6 +26,7 @@ impl Default for Settings {
             input_device: None,
             output_device: None,
             input_sensitivity_db: -50.0,
+            close_to_tray: true,
         }
     }
 }

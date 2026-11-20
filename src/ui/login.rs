@@ -4,10 +4,7 @@ use crate::{
     store::{Connection, Store},
 };
 use gpui::{prelude::*, *};
-use gpui_component::{
-    button::{Button, ButtonVariants as _},
-    input::{Input, InputEvent, InputState},
-};
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_kit::assets::IconName;
 
 pub struct LoginView {
@@ -111,9 +108,19 @@ impl Render for LoginView {
                     )
                 })
                 .child(
-                    Button::new("login")
-                        .primary()
-                        .label("Log in")
+                    div()
+                        .id("login")
+                        .h(px(36.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(theme::accent())
+                        .text_color(theme::on_accent())
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .hover(|s| s.opacity(0.9))
+                        .child("Log in")
                         .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                 )
                 .child(
