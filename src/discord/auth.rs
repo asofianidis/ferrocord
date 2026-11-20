@@ -76,27 +76,54 @@ pub fn describe_error(v: &Value, status: u16) -> String {
     v["message"].as_str().map_or_else(|| format!("Signing in failed (HTTP {status})."), str::to_string)
 }
 
+/// One sign-in attempt, from password to two-factor code.
+///
+/// Discord ties the two-factor ticket to the session that asked for it: the
+/// cookies it sets and the device fingerprint it hands out. A browser keeps
+/// both automatically; here one `Auth` must be used for the whole attempt.
 pub struct Auth {
     http: reqwest::Client,
+    fingerprint: parking_lot::Mutex<Option<String>>,
 }
 
 impl Auth {
     pub fn new() -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
+            .cookie_store(true)
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(30))
             .build()?;
-        Ok(Self { http })
+        Ok(Self { http, fingerprint: parking_lot::Mutex::new(None) })
+    }
+
+    /// Asks Discord for a device fingerprint (it also sets the session
+    /// cookies). Failing is not fatal; sign-in is simply attempted without.
+    async fn ensure_fingerprint(&self) {
+        if self.fingerprint.lock().is_some() {
+            return;
+        }
+        let reply = async { self.http.get(format!("{API}/experiments")).send().await?.json::<Value>().await };
+        match reply.await {
+            Ok(v) => *self.fingerprint.lock() = v["fingerprint"].as_str().map(str::to_string),
+            Err(e) => log::warn!("could not get a device fingerprint: {e}"),
+        }
     }
 
     async fn post(&self, path: &str, body: Value) -> Result<Value> {
-        let resp = self.http.post(format!("{API}{path}")).json(&body).send().await?;
+        self.ensure_fingerprint().await;
+        let mut req = self.http.post(format!("{API}{path}")).json(&body);
+        if let Some(fp) = self.fingerprint.lock().clone() {
+            req = req.header("X-Fingerprint", fp);
+        }
+        let resp = req.send().await?;
         let status = resp.status();
         let value: Value = resp.json().await.unwrap_or(Value::Null);
         if status.is_success() {
             Ok(value)
         } else {
+            // Error replies carry no secrets; keep them for diagnosing failures.
+            log::warn!("sign-in step {path} failed with HTTP {}: {value}", status.as_u16());
             Err(anyhow!(describe_error(&value, status.as_u16())))
         }
     }

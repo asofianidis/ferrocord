@@ -226,6 +226,8 @@ pub struct Store {
     /// Progress of an email-and-password sign-in, and its latest error.
     pub auth_step: AuthStep,
     pub auth_error: Option<String>,
+    /// The session of the sign-in in progress; two-factor codes must use it.
+    auth_session: Option<std::sync::Arc<discord::auth::Auth>>,
     /// About-me text and pronouns, fetched when settings open (user accounts).
     pub my_profile: Option<Profile>,
     gateway_session: String,
@@ -336,6 +338,7 @@ impl Store {
             my_profile: None,
             auth_step: AuthStep::Idle,
             auth_error: None,
+            auth_session: None,
             events: HashMap::new(),
             interested: Default::default(),
             gateway_session: String::new(),
@@ -369,6 +372,7 @@ impl Store {
     fn auth_succeeded(&mut self, token: String, cx: &mut Context<Self>) {
         self.auth_step = AuthStep::Idle;
         self.auth_error = None;
+        self.auth_session = None;
         crate::credentials::save(&token, false);
         self.login(token, false, cx);
     }
@@ -379,9 +383,10 @@ impl Store {
             return self.auth_failed("Enter your email or phone number and your password.", cx);
         }
         let auth = match discord::auth::Auth::new() {
-            Ok(auth) => auth,
+            Ok(auth) => std::sync::Arc::new(auth),
             Err(e) => return self.auth_failed(e.to_string(), cx),
         };
+        self.auth_session = Some(auth.clone());
         self.auth_step = AuthStep::Working;
         self.auth_error = None;
         cx.notify();
@@ -423,7 +428,7 @@ impl Store {
         if code.is_empty() {
             return;
         }
-        let Ok(auth) = discord::auth::Auth::new() else { return };
+        let Some(auth) = self.auth_session.clone() else { return };
         self.auth_error = None;
         cx.notify();
         let by_sms = texted_to.is_some();
@@ -440,7 +445,7 @@ impl Store {
     /// Switches the second step to a texted code.
     pub fn text_auth_code(&mut self, cx: &mut Context<Self>) {
         let AuthStep::Code { ticket, totp, sms, .. } = self.auth_step.clone() else { return };
-        let Ok(auth) = discord::auth::Auth::new() else { return };
+        let Some(auth) = self.auth_session.clone() else { return };
         self.run(cx, async move { auth.send_sms(&ticket).await }, move |store, result, cx| match result {
             Ok(phone) => {
                 if let AuthStep::Code { ticket, .. } = store.auth_step.clone() {
@@ -456,6 +461,7 @@ impl Store {
     pub fn cancel_auth(&mut self, cx: &mut Context<Self>) {
         self.auth_step = AuthStep::Idle;
         self.auth_error = None;
+        self.auth_session = None;
         cx.notify();
     }
 
