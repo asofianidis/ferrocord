@@ -86,6 +86,12 @@ impl Store {
                 { "id": "401", "last_message_id": "700" },
                 { "id": "402", "last_message_id": "800" },
             ],
+            "relationships": [
+                { "id": "2", "type": 1, "user": people[0] },
+                { "id": "4", "type": 1, "user": people[2] },
+                { "id": "3", "type": 3, "user": people[1] },
+                { "id": "6", "type": 4, "user": people[4] },
+            ],
             "presences": [
                 { "user": { "id": "1" }, "status": "online" },
                 { "user": { "id": "2" }, "status": "online" },

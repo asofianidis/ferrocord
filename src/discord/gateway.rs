@@ -35,6 +35,10 @@ pub struct Ready {
     pub private_channels: Vec<Channel>,
     pub read_states: Vec<ReadState>,
     pub presences: Vec<(Id, Status)>,
+    /// Friends, blocks and pending requests (user accounts only).
+    pub relationships: Vec<(User, u8)>,
+    /// Mute state of guilds and channels (user accounts only).
+    pub mutes: Vec<(Id, bool)>,
 }
 
 #[derive(Debug)]
@@ -65,6 +69,9 @@ pub enum Event {
     OwnMemberUpdate { guild_id: Id, roles: Vec<Id> },
     VoiceState { user_id: Id, channel_id: Option<Id>, member: Option<Member> },
     PollVote { channel_id: Id, message_id: Id, user_id: Id, answer_id: u32, added: bool },
+    /// `kind` is `None` when the relationship was removed.
+    Relationship { id: Id, user: Option<User>, kind: Option<u8> },
+    Mutes(Vec<(Id, bool)>),
 }
 
 #[derive(Debug)]
@@ -478,6 +485,14 @@ fn dispatch(state: &mut State, kind: &str, mut d: Value) -> Vec<Event> {
             let answer_id = d["answer_id"].as_u64().unwrap_or(0) as u32;
             vec![Event::PollVote { channel_id, message_id, user_id, answer_id, added: kind == "MESSAGE_POLL_VOTE_ADD" }]
         }
+        "RELATIONSHIP_ADD" | "RELATIONSHIP_UPDATE" => {
+            let Some(id) = id_of(&d["id"]) else { return vec![] };
+            let kind = d["type"].as_u64().map(|k| k as u8);
+            let user = serde_json::from_value(d["user"].take()).ok();
+            vec![Event::Relationship { id, user, kind }]
+        }
+        "RELATIONSHIP_REMOVE" => one(id_of(&d["id"]).map(|id| Event::Relationship { id, user: None, kind: None })),
+        "USER_GUILD_SETTINGS_UPDATE" => vec![Event::Mutes(parse_mutes(&d))],
         "VOICE_STATE_UPDATE" => {
             let Some(user_id) = id_of(&d["user_id"]) else { return vec![] };
             let channel_id = id_of(&d["channel_id"]);
@@ -501,6 +516,32 @@ fn dispatch(state: &mut State, kind: &str, mut d: Value) -> Vec<Event> {
         }
         _ => vec![],
     }
+}
+
+/// Reads the mute flags out of one `user_guild_settings` entry.
+fn parse_mutes(entry: &Value) -> Vec<(Id, bool)> {
+    let mut out = Vec::new();
+    if let Some(guild) = id_of(&entry["guild_id"]) {
+        out.push((guild, entry["muted"].as_bool().unwrap_or(false)));
+    }
+    match &entry["channel_overrides"] {
+        Value::Array(list) => {
+            for o in list {
+                if let Some(channel) = id_of(&o["channel_id"]) {
+                    out.push((channel, o["muted"].as_bool().unwrap_or(false)));
+                }
+            }
+        }
+        Value::Object(map) => {
+            for (key, o) in map {
+                if let Ok(channel) = key.parse() {
+                    out.push((Id(channel), o["muted"].as_bool().unwrap_or(false)));
+                }
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 pub fn parse_ready(mut d: Value) -> Ready {
@@ -563,7 +604,27 @@ pub fn parse_ready(mut d: Value) -> Ready {
         _ => Vec::new(),
     };
 
+    let mut relationships = Vec::new();
+    for r in d["relationships"].as_array().into_iter().flatten() {
+        let kind = r["type"].as_u64().unwrap_or(0) as u8;
+        let embedded: Option<User> = serde_json::from_value(r["user"].clone()).ok();
+        let id = id_of(&r["user_id"]).or_else(|| id_of(&r["id"]));
+        let found = embedded.or_else(|| users.iter().find(|u| Some(u.id) == id).cloned());
+        if let Some(user) = found {
+            relationships.push((user, kind));
+        }
+    }
+
+    // `user_guild_settings` is either a bare array or `{ entries: [...] }`.
+    let mut guild_settings = d["user_guild_settings"].take();
+    if guild_settings.is_object() {
+        guild_settings = guild_settings["entries"].take();
+    }
+    let mutes = guild_settings.as_array().into_iter().flatten().flat_map(parse_mutes).collect();
+
     Ready {
+        relationships,
+        mutes,
         session_id: String::new(),
         user,
         guilds,
@@ -638,6 +699,10 @@ mod tests {
                 { "id": "30", "last_message_id": null }
             ]},
             "presences": [{ "user_id": "2", "status": "idle" }],
+            "relationships": [{ "id": "2", "type": 1, "user_id": "2" }, { "id": "404", "type": 1 }],
+            "user_guild_settings": { "entries": [{ "guild_id": "10", "muted": true, "channel_overrides": [
+                { "channel_id": "11", "muted": false }, { "channel_id": "12", "muted": true }
+            ]}]},
         }));
         assert_eq!(ready.user.display_name(), "Me");
         assert_eq!(ready.guilds[0].name, "Nested");
@@ -648,6 +713,9 @@ mod tests {
         assert_eq!(ready.read_states.len(), 2);
         assert_eq!(ready.read_states[0].mention_count, 3);
         assert_eq!(ready.presences, vec![(Id(2), Status::Idle)]);
+        assert_eq!(ready.relationships.len(), 1);
+        assert_eq!((ready.relationships[0].0.id, ready.relationships[0].1), (Id(2), 1));
+        assert_eq!(ready.mutes, vec![(Id(10), true), (Id(11), false), (Id(12), true)]);
     }
 
     #[test]

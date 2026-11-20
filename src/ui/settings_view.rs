@@ -28,7 +28,8 @@ impl SettingsView {
     fn choose(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(palette) = self.themes.get(ix) else { return };
         theme::apply(palette, cx);
-        settings::Settings { theme: palette.id.clone() }.save();
+        let id = palette.id.clone();
+        settings::Settings::update(|s| s.theme = id);
         cx.notify();
     }
 

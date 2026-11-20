@@ -22,6 +22,7 @@ impl Sidebar {
             if matches!(
                 event,
                 StoreEvent::Guilds
+                    | StoreEvent::Friends
                     | StoreEvent::Channels
                     | StoreEvent::Selection
                     | StoreEvent::Unread
@@ -101,6 +102,7 @@ impl Sidebar {
             let unread = !selected && store.is_unread(id);
             let mentions = store.mentions(id);
             let is_thread = row.kind == RowKind::Thread;
+            let muted = store.muted.contains(&id);
             let color = if selected || unread { theme::text_bright() } else { theme::text_muted() };
             out.push(
                 div()
@@ -133,6 +135,7 @@ impl Sidebar {
                             .rounded_md()
                             .cursor_pointer()
                             .text_color(color)
+                            .when(muted && !selected, |d| d.opacity(0.45))
                             .when(unread, |d| d.font_weight(FontWeight::SEMIBOLD))
                             .when(selected, |d| d.bg(theme::bg_active()))
                             .when(!selected, |d| d.hover(|s| s.bg(theme::bg_hover()).text_color(theme::text())))
@@ -147,9 +150,17 @@ impl Sidebar {
                         let store = self.store.clone();
                         move |menu, _, _| {
                             let store = store.clone();
+                            let (mute, invite) = (store.clone(), store.clone());
                             menu.item(PopupMenuItem::new("Mark as Read").on_click(move |_, _, cx| {
                                 store.update(cx, |store, cx| store.mark_read(id, cx));
                             }))
+                            .item(PopupMenuItem::new(if muted { "Unmute Channel" } else { "Mute Channel" }).on_click(
+                                move |_, _, cx| mute.update(cx, |store, cx| store.toggle_mute(id, cx)),
+                            ))
+                            .item(PopupMenuItem::new("Copy Invite Link").on_click(move |_, _, cx| {
+                                invite.update(cx, |store, cx| store.copy_invite(id, cx));
+                            }))
+                            .separator()
                             .item(PopupMenuItem::new("Copy Channel ID").on_click(move |_, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(id.to_string()));
                             }))
@@ -230,6 +241,23 @@ impl Sidebar {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.store.update(cx, |store, cx| store.select_channel(id, cx));
                     }))
+                    .context_menu({
+                        let store = self.store.clone();
+                        let muted = store.read(cx).muted.contains(&id);
+                        let is_group = channel.kind == channel_kind::GROUP_DM;
+                        move |menu, _, _| {
+                            let (read, mute, close) = (store.clone(), store.clone(), store.clone());
+                            menu.item(PopupMenuItem::new("Mark as Read").on_click(move |_, _, cx| {
+                                read.update(cx, |store, cx| store.mark_read(id, cx));
+                            }))
+                            .item(PopupMenuItem::new(if muted { "Unmute" } else { "Mute" }).on_click(
+                                move |_, _, cx| mute.update(cx, |store, cx| store.toggle_mute(id, cx)),
+                            ))
+                            .item(PopupMenuItem::new(if is_group { "Leave Group" } else { "Close Conversation" }).on_click(
+                                move |_, _, cx| close.update(cx, |store, cx| store.close_dm(id, cx)),
+                            ))
+                        }
+                    })
                     .into_any_element(),
             );
         }
@@ -276,7 +304,32 @@ impl Render for Sidebar {
             }
             None => (
                 "Direct Messages".to_string(),
-                if store.dms.is_empty() {
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child({
+                        let active = store.show_friends;
+                        let pending = store.relationships.iter().filter(|(_, kind)| *kind == 3).count() as u32;
+                        div().px_2().pt_2().pb_1().flex_shrink_0().child(
+                            h_flex()
+                                .id("friends-entry")
+                                .h(px(38.))
+                                .px_2()
+                                .gap_3()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_color(if active { theme::text_bright() } else { theme::text_muted() })
+                                .when(active, |d| d.bg(theme::bg_active()))
+                                .when(!active, |d| d.hover(|s| s.bg(theme::bg_hover()).text_color(theme::text())))
+                                .child(icon(IconName::Users, 18., theme::text_muted()))
+                                .child(div().flex_1().child("Friends"))
+                                .when(pending > 0, |d| d.child(badge(pending)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.store.update(cx, |store, cx| store.open_friends(cx));
+                                })),
+                        )
+                    })
+                    .child(if store.dms.is_empty() {
                     div()
                         .flex_1()
                         .p_4()
@@ -285,7 +338,8 @@ impl Render for Sidebar {
                         .into_any_element()
                 } else {
                     uniform_list("dms", store.dms.len(), cx.processor(Self::dm_rows)).flex_1().into_any_element()
-                },
+                    })
+                    .into_any_element(),
             ),
         };
 

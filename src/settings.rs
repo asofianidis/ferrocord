@@ -7,11 +7,13 @@ use std::path::PathBuf;
 #[serde(default)]
 pub struct Settings {
     pub theme: String,
+    /// Channels and servers muted on this device.
+    pub muted: Vec<u64>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { theme: crate::ui::theme::DEFAULT_THEME.to_string() }
+        Self { theme: crate::ui::theme::DEFAULT_THEME.to_string(), muted: Vec::new() }
     }
 }
 
@@ -29,6 +31,13 @@ impl Settings {
             .and_then(|d| std::fs::read_to_string(d.join("settings.json")).ok())
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
+    }
+
+    /// Loads the settings, applies `change` and writes them back.
+    pub fn update(change: impl FnOnce(&mut Settings)) {
+        let mut settings = Self::load();
+        change(&mut settings);
+        settings.save();
     }
 
     pub fn save(&self) {

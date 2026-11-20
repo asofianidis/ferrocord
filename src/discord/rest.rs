@@ -239,6 +239,79 @@ impl Rest {
         Ok(())
     }
 
+    pub async fn add_friend(&self, username: &str) -> Result<()> {
+        let body = json!({ "username": username });
+        self.send(|| self.request(Method::POST, "/users/@me/relationships").json(&body)).await?;
+        Ok(())
+    }
+
+    /// Accepts a friend request (or sends one, by id).
+    pub async fn accept_friend(&self, user: Id) -> Result<()> {
+        let path = format!("/users/@me/relationships/{user}");
+        self.send(|| self.request(Method::PUT, &path).json(&json!({}))).await?;
+        Ok(())
+    }
+
+    pub async fn block_user(&self, user: Id) -> Result<()> {
+        let path = format!("/users/@me/relationships/{user}");
+        self.send(|| self.request(Method::PUT, &path).json(&json!({ "type": 2 }))).await?;
+        Ok(())
+    }
+
+    /// Removes a friend, block or pending request.
+    pub async fn remove_relationship(&self, user: Id) -> Result<()> {
+        let path = format!("/users/@me/relationships/{user}");
+        self.send(|| self.request(Method::DELETE, &path)).await?;
+        Ok(())
+    }
+
+    pub async fn create_group_dm(&self, users: &[Id]) -> Result<Channel> {
+        let ids: Vec<String> = users.iter().map(|u| u.to_string()).collect();
+        let body = json!({ "recipients": ids });
+        Ok(self
+            .send(|| self.request(Method::POST, "/users/@me/channels").json(&body))
+            .await?
+            .json()
+            .await?)
+    }
+
+    /// Closes a DM, or leaves a group DM.
+    pub async fn close_dm(&self, channel: Id) -> Result<()> {
+        let path = format!("/channels/{channel}");
+        self.send(|| self.request(Method::DELETE, &path)).await?;
+        Ok(())
+    }
+
+    pub async fn leave_guild(&self, guild: Id) -> Result<()> {
+        let path = format!("/users/@me/guilds/{guild}");
+        self.send(|| self.request(Method::DELETE, &path).json(&json!({ "lurking": false }))).await?;
+        Ok(())
+    }
+
+    /// Creates a one-day invite and returns its code.
+    pub async fn create_invite(&self, channel: Id) -> Result<String> {
+        let path = format!("/channels/{channel}/invites");
+        let body = json!({ "max_age": 86400, "max_uses": 0, "temporary": false });
+        let invite: Value = self.send(|| self.request(Method::POST, &path).json(&body)).await?.json().await?;
+        invite["code"].as_str().map(str::to_string).ok_or_else(|| anyhow!("no invite code returned"))
+    }
+
+    /// Mutes or unmutes a guild, or one channel inside it. User accounts only.
+    pub async fn set_muted(&self, guild: Option<Id>, channel: Option<Id>, muted: bool) -> Result<()> {
+        let scope = guild.map_or_else(|| "@me".to_string(), |g| g.to_string());
+        let path = format!("/users/@me/guilds/{scope}/settings");
+        let body = match channel {
+            Some(channel) => {
+                let mut overrides = serde_json::Map::new();
+                overrides.insert(channel.to_string(), json!({ "muted": muted }));
+                json!({ "channel_overrides": overrides })
+            }
+            None => json!({ "muted": muted }),
+        };
+        self.send(|| self.request(Method::PATCH, &path).json(&body)).await?;
+        Ok(())
+    }
+
     pub async fn open_dm(&self, user: Id) -> Result<Channel> {
         let body = json!({ "recipient_id": user.to_string() });
         Ok(self

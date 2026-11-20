@@ -38,6 +38,7 @@ impl Rail {
         mentions: u32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let name_for_menu = name.clone();
         let pill_height = if selected {
             36.
         } else if unread {
@@ -75,11 +76,35 @@ impl Rail {
             }));
         let Some(guild) = target else { return row.into_any_element() };
         let store = self.store.clone();
+        let muted = store.read(cx).muted.contains(&guild);
+        let guild_name = name_for_menu;
         row.context_menu(move |menu, _, _| {
+            let (mute, leave) = (store.clone(), store.clone());
             let store = store.clone();
+            let guild_name = guild_name.clone();
             menu.item(PopupMenuItem::new("Mark Server as Read").on_click(move |_, _, cx| {
                 store.update(cx, |store, cx| store.mark_guild_read(guild, cx));
             }))
+            .item(PopupMenuItem::new(if muted { "Unmute Server" } else { "Mute Server" }).on_click(
+                move |_, _, cx| mute.update(cx, |store, cx| store.toggle_mute(guild, cx)),
+            ))
+            .item(PopupMenuItem::new("Leave Server").on_click(move |_, window, cx| {
+                let answer = window.prompt(
+                    PromptLevel::Warning,
+                    &format!("Leave {guild_name}?"),
+                    Some("You will need a new invite to rejoin."),
+                    &["Leave", "Cancel"],
+                    cx,
+                );
+                let leave = leave.clone();
+                cx.spawn(async move |cx| {
+                    if answer.await == Ok(0) {
+                        let _ = leave.update(cx, |store, cx| store.leave_guild(guild, cx));
+                    }
+                })
+                .detach();
+            }))
+            .separator()
             .item(PopupMenuItem::new("Copy Server ID").on_click(move |_, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(guild.to_string()));
             }))

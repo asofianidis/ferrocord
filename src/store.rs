@@ -56,6 +56,9 @@ pub enum StoreEvent {
     Messages { channel: Id, change: MessageChange },
     Typing(Id),
     Members(Id),
+    Friends,
+    /// Text to place on the clipboard, with a confirmation to show.
+    Clipboard { text: String, notice: String },
     /// Someone mentioned or messaged the user in a channel that is not open.
     Mention { title: String, body: String },
     Error(String),
@@ -154,6 +157,11 @@ pub struct Store {
     pub voice: HashMap<Id, Vec<Id>>,
     pub my_status: Status,
     gateway_session: String,
+    /// Relationship type per user: 1 friend, 2 blocked, 3 incoming, 4 outgoing.
+    pub relationships: Vec<(Id, u8)>,
+    pub muted: std::collections::HashSet<Id>,
+    /// The friends page is showing instead of a conversation.
+    pub show_friends: bool,
     forums_loaded: std::collections::HashSet<Id>,
 
     /// `None` is the direct-messages view.
@@ -212,6 +220,9 @@ impl Store {
             voice: HashMap::new(),
             my_status: Status::Online,
             gateway_session: String::new(),
+            relationships: Vec::new(),
+            muted: crate::settings::Settings::load().muted.into_iter().map(Id).collect(),
+            show_friends: false,
             forums_loaded: Default::default(),
             selected_guild: None,
             selected_channel: None,
@@ -404,7 +415,15 @@ impl Store {
 
     // ---------------------------------------------------------------- unread
 
+    pub fn is_muted(&self, channel: Id) -> bool {
+        self.muted.contains(&channel)
+            || self.channels.get(&channel).and_then(|c| c.guild_id).is_some_and(|g| self.muted.contains(&g))
+    }
+
     pub fn is_unread(&self, channel: Id) -> bool {
+        if self.is_muted(channel) {
+            return false;
+        }
         let Some(last) = self.channels.get(&channel).and_then(|c| c.last_message_id) else { return false };
         match self.read.get(&channel) {
             Some(marker) => marker.last_read.is_none_or(|read| read < last),
@@ -531,10 +550,18 @@ impl Store {
 
     // ---------------------------------------------------------------- selection
 
+    pub fn open_friends(&mut self, cx: &mut Context<Self>) {
+        self.selected_guild = None;
+        self.selected_channel = None;
+        self.show_friends = true;
+        cx.emit(StoreEvent::Selection);
+    }
+
     pub fn select_guild(&mut self, guild: Option<Id>, cx: &mut Context<Self>) {
-        if self.selected_guild == guild && self.selected_channel.is_some() {
+        if self.selected_guild == guild && (self.selected_channel.is_some() || self.show_friends) {
             return;
         }
+        self.show_friends = false;
         self.selected_guild = guild;
         let channel = self.last_channel.get(&guild).copied().filter(|c| self.channels.contains_key(c)).or_else(|| {
             match guild {
@@ -566,6 +593,7 @@ impl Store {
             return;
         }
         let guild = info.guild_id;
+        self.show_friends = false;
         self.selected_guild = guild;
         self.selected_channel = Some(channel);
         self.last_channel.insert(guild, channel);
@@ -620,6 +648,164 @@ impl Store {
                 let id = channel.id;
                 store.upsert_channel(channel, cx);
                 store.select_channel(id, cx);
+            }
+        });
+    }
+
+    // ---------------------------------------------------------------- friends, mutes and membership
+
+    pub fn relationship(&self, user: Id) -> Option<u8> {
+        self.relationships.iter().find(|(id, _)| *id == user).map(|(_, kind)| *kind)
+    }
+
+    fn set_relationship(&mut self, user: Id, kind: Option<u8>, cx: &mut Context<Self>) {
+        self.relationships.retain(|(id, _)| *id != user);
+        if let Some(kind) = kind {
+            self.relationships.push((user, kind));
+        }
+        cx.emit(StoreEvent::Friends);
+    }
+
+    /// Runs a relationship request; in demo mode applies `local` instead.
+    fn relationship_call<F>(
+        &mut self,
+        user: Option<Id>,
+        local: Option<u8>,
+        what: &'static str,
+        cx: &mut Context<Self>,
+        call: impl FnOnce(Rest) -> F + Send + 'static,
+    ) where
+        F: Future<Output = Result<()>> + Send + 'static,
+    {
+        if self.demo {
+            if let Some(user) = user {
+                self.set_relationship(user, local, cx);
+            }
+            return;
+        }
+        let Some(rest) = self.rest.clone() else { return };
+        if rest.is_bot() {
+            cx.emit(StoreEvent::Error("Friends are only available to user accounts.".into()));
+            return;
+        }
+        self.run(cx, async move { call(rest).await }, move |store, result, cx| {
+            store.report(result, what, cx);
+        });
+    }
+
+    pub fn add_friend(&mut self, username: String, cx: &mut Context<Self>) {
+        if self.demo {
+            cx.emit(StoreEvent::Error("Friend requests are not sent in demo mode.".into()));
+            return;
+        }
+        self.relationship_call(None, None, "Could not send friend request", cx, move |rest| async move {
+            rest.add_friend(&username).await
+        });
+    }
+
+    pub fn accept_friend(&mut self, user: Id, cx: &mut Context<Self>) {
+        self.relationship_call(Some(user), Some(1), "Could not accept request", cx, move |rest| async move {
+            rest.accept_friend(user).await
+        });
+    }
+
+    pub fn block_user(&mut self, user: Id, cx: &mut Context<Self>) {
+        self.relationship_call(Some(user), Some(2), "Could not block user", cx, move |rest| async move {
+            rest.block_user(user).await
+        });
+    }
+
+    pub fn remove_relationship(&mut self, user: Id, cx: &mut Context<Self>) {
+        self.relationship_call(Some(user), None, "Could not update relationship", cx, move |rest| async move {
+            rest.remove_relationship(user).await
+        });
+    }
+
+    pub fn create_group_dm(&mut self, users: Vec<Id>, cx: &mut Context<Self>) {
+        if self.demo {
+            let recipients = users.iter().filter_map(|u| self.users.get(u).cloned()).collect();
+            let id = Id::now();
+            let channel = Channel { id, kind: channel_kind::GROUP_DM, recipients, ..Default::default() };
+            self.messages.insert(id, ChannelMessages { loaded: true, reached_start: true, ..Default::default() });
+            self.upsert_channel(channel, cx);
+            self.select_channel(id, cx);
+            return;
+        }
+        let Some(rest) = self.rest.clone() else { return };
+        self.run(cx, async move { rest.create_group_dm(&users).await }, |store, result, cx| {
+            if let Some(channel) = store.report(result, "Could not create group", cx) {
+                let id = channel.id;
+                store.upsert_channel(channel, cx);
+                store.select_channel(id, cx);
+            }
+        });
+    }
+
+    pub fn close_dm(&mut self, channel: Id, cx: &mut Context<Self>) {
+        if self.demo {
+            self.apply(Event::ChannelDelete(channel), cx);
+            return;
+        }
+        let Some(rest) = self.rest.clone() else { return };
+        self.run(cx, async move { rest.close_dm(channel).await }, move |store, result, cx| {
+            if store.report(result, "Could not close conversation", cx).is_some() {
+                store.apply(Event::ChannelDelete(channel), cx);
+            }
+        });
+    }
+
+    pub fn leave_guild(&mut self, guild: Id, cx: &mut Context<Self>) {
+        if self.demo {
+            self.apply(Event::GuildDelete(guild), cx);
+            return;
+        }
+        let Some(rest) = self.rest.clone() else { return };
+        self.run(cx, async move { rest.leave_guild(guild).await }, move |store, result, cx| {
+            if store.report(result, "Could not leave server", cx).is_some() {
+                store.apply(Event::GuildDelete(guild), cx);
+            }
+        });
+    }
+
+    pub fn copy_invite(&mut self, channel: Id, cx: &mut Context<Self>) {
+        let copied = |code: &str| StoreEvent::Clipboard {
+            text: format!("https://discord.gg/{code}"),
+            notice: "Invite link copied. It expires in one day.".into(),
+        };
+        if self.demo {
+            cx.emit(copied("demo-invite"));
+            return;
+        }
+        let Some(rest) = self.rest.clone() else { return };
+        self.run(cx, async move { rest.create_invite(channel).await }, move |store, result, cx| {
+            if let Some(code) = store.report(result, "Could not create invite", cx) {
+                cx.emit(copied(&code));
+            }
+        });
+    }
+
+    /// Mutes or unmutes a server (pass its id) or a single channel.
+    pub fn toggle_mute(&mut self, target: Id, cx: &mut Context<Self>) {
+        let muted = !self.muted.contains(&target);
+        if muted {
+            self.muted.insert(target);
+        } else {
+            self.muted.remove(&target);
+        }
+        let all: Vec<u64> = self.muted.iter().map(|id| id.0).collect();
+        crate::settings::Settings::update(|s| s.muted = all);
+        cx.emit(StoreEvent::Unread);
+        cx.emit(StoreEvent::Channels);
+
+        // Keep Discord's own setting in step for user accounts.
+        let Some(rest) = self.rest.clone().filter(|r| !r.is_bot() && !self.demo) else { return };
+        let (guild, channel) = match self.channels.get(&target) {
+            Some(info) => (info.guild_id, Some(target)),
+            None => (Some(target), None),
+        };
+        self.run(cx, async move { rest.set_muted(guild, channel, muted).await }, |_, result, _| {
+            if let Err(e) = result {
+                log::warn!("could not sync mute setting: {e}");
             }
         });
     }
@@ -1360,6 +1546,7 @@ impl Store {
                     self.sort_dms();
                     cx.emit(StoreEvent::Channels);
                 }
+                let muted = self.is_muted(channel);
                 // Prepare the toast before the message moves into the list.
                 let notice = (mentioned || is_dm).then(|| {
                     let info = self.channels.get(&channel);
@@ -1384,7 +1571,7 @@ impl Store {
                     let marker = self.read.entry(channel).or_default();
                     if mentioned || is_dm {
                         marker.mentions += 1;
-                        if let Some(notice) = notice {
+                        if let Some(notice) = notice.filter(|_| !muted) {
                             cx.emit(notice);
                         }
                     }
@@ -1488,6 +1675,23 @@ impl Store {
                 }
                 cx.emit(StoreEvent::Channels);
             }
+            Event::Relationship { id, user, kind } => {
+                if let Some(user) = user {
+                    self.users.insert(user.id, user);
+                }
+                self.set_relationship(id, kind, cx);
+            }
+            Event::Mutes(changes) => {
+                for (id, muted) in changes {
+                    if muted {
+                        self.muted.insert(id);
+                    } else {
+                        self.muted.remove(&id);
+                    }
+                }
+                cx.emit(StoreEvent::Unread);
+                cx.emit(StoreEvent::Channels);
+            }
             Event::PollVote { channel_id, message_id, user_id, answer_id, added } => {
                 let mine = user_id == self.my_id();
                 self.modify_message(channel_id, message_id, cx, |m| {
@@ -1545,6 +1749,16 @@ impl Store {
         }
 
         self.gateway_session = ready.session_id.clone();
+        self.relationships.clear();
+        for (user, kind) in ready.relationships {
+            self.relationships.push((user.id, kind));
+            self.users.entry(user.id).or_insert(user);
+        }
+        for (id, muted) in ready.mutes {
+            if muted {
+                self.muted.insert(id);
+            }
+        }
         self.forums_loaded.clear();
         self.users.insert(ready.user.id, ready.user.clone());
         self.me = Some(ready.user);

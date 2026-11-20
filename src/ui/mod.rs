@@ -1,6 +1,7 @@
 //! Top-level window content.
 
 mod chat;
+mod friends;
 mod login;
 mod members;
 mod rail;
@@ -28,6 +29,7 @@ pub struct AppView {
     sidebar: Entity<sidebar::Sidebar>,
     chat: Entity<chat::ChatView>,
     members: Entity<members::Members>,
+    friends: Entity<friends::FriendsView>,
     switcher: Option<Entity<switcher::Switcher>>,
     _switcher_sub: Option<Subscription>,
     settings: Option<Entity<settings_view::SettingsView>>,
@@ -43,6 +45,7 @@ impl AppView {
         let sidebar = cx.new(|cx| sidebar::Sidebar::new(store.clone(), cx));
         let chat = cx.new(|cx| chat::ChatView::new(store.clone(), window, cx));
         let members = cx.new(|cx| members::Members::new(store.clone(), cx));
+        let friends = cx.new(|cx| friends::FriendsView::new(store.clone(), window, cx));
 
         let subs = vec![cx.subscribe_in(&store, window, |this, store, event: &StoreEvent, window, cx| match event {
             StoreEvent::Connection => {
@@ -58,6 +61,10 @@ impl AppView {
             }
             StoreEvent::Error(message) => {
                 window.push_notification(Notification::error(message.clone()), cx);
+            }
+            StoreEvent::Clipboard { text, notice } => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                window.push_notification(Notification::success(notice.clone()), cx);
             }
             StoreEvent::Mention { title, body } => {
                 window.push_notification(Notification::info(body.clone()).title(title.clone()), cx);
@@ -80,6 +87,7 @@ impl AppView {
             sidebar,
             chat,
             members,
+            friends,
             switcher: None,
             _switcher_sub: None,
             settings: None,
@@ -252,7 +260,13 @@ impl Render for AppView {
                             .items_stretch()
                             .child(self.rail.clone())
                             .child(self.sidebar.clone())
-                            .child(self.chat.clone())
+                            .map(|d| {
+                                if store.show_friends && store.selected_guild.is_none() {
+                                    d.child(self.friends.clone())
+                                } else {
+                                    d.child(self.chat.clone())
+                                }
+                            })
                             .when(show_members, |d| d.child(self.members.clone())),
                     )
             }
