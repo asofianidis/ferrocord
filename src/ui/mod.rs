@@ -1,5 +1,6 @@
 //! Top-level window content.
 
+mod call;
 mod chat;
 mod friends;
 mod login;
@@ -61,6 +62,20 @@ impl AppView {
             }
             StoreEvent::Error(message) => {
                 window.push_notification(Notification::error(message.clone()), cx);
+            }
+            StoreEvent::IncomingCall { channel, title } => {
+                let channel = *channel;
+                let store = this.store.clone();
+                let note = Notification::info(format!("{title} is calling you. Click to join."))
+                    .title("Incoming call")
+                    .autohide(false)
+                    .on_click(move |_, _, cx| {
+                        store.update(cx, |store, cx| {
+                            store.select_channel(channel, cx);
+                            store.join_voice(channel, cx);
+                        });
+                    });
+                window.push_notification(note, cx);
             }
             StoreEvent::Notice(message) => {
                 window.push_notification(Notification::success(message.clone()), cx);

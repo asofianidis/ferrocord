@@ -349,6 +349,40 @@ impl Rest {
         Ok(self.send(|| self.request(Method::POST, &path).json(&body)).await?.json().await?)
     }
 
+    /// Rings the other people in a direct-message call.
+    pub async fn ring(&self, channel: Id) -> Result<()> {
+        let path = format!("/channels/{channel}/call/ring");
+        self.send(|| self.request(Method::POST, &path).json(&json!({ "recipients": null }))).await?;
+        Ok(())
+    }
+
+    /// Updates a stage voice state: `user` is `None` for ourselves.
+    pub async fn update_voice_state(&self, guild: Id, user: Option<Id>, body: Value) -> Result<()> {
+        let who = user.map_or_else(|| "@me".to_string(), |u| u.to_string());
+        let path = format!("/guilds/{guild}/voice-states/{who}");
+        self.send(|| self.request(Method::PATCH, &path).json(&body)).await?;
+        Ok(())
+    }
+
+    pub async fn start_stage(&self, channel: Id, topic: &str) -> Result<()> {
+        let body = json!({ "channel_id": channel.to_string(), "topic": topic });
+        self.send(|| self.request(Method::POST, "/stage-instances").json(&body)).await?;
+        Ok(())
+    }
+
+    pub async fn end_stage(&self, channel: Id) -> Result<()> {
+        let path = format!("/stage-instances/{channel}");
+        self.send(|| self.request(Method::DELETE, &path)).await?;
+        Ok(())
+    }
+
+    /// Changes a member: nickname, roles, server mute or deafen, voice channel, timeout.
+    pub async fn modify_member(&self, guild: Id, user: Id, body: Value) -> Result<()> {
+        let path = format!("/guilds/{guild}/members/{user}");
+        self.send(|| self.request(Method::PATCH, &path).json(&body)).await?;
+        Ok(())
+    }
+
     pub async fn open_dm(&self, user: Id) -> Result<Channel> {
         let body = json!({ "recipient_id": user.to_string() });
         Ok(self

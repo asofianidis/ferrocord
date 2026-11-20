@@ -5,7 +5,8 @@
 //! fine-grained [`StoreEvent`]s so that only the affected view re-renders.
 
 use crate::discord::{
-    self, Channel, Emoji, Gif, Guild, Id, Member, Message, Reaction, Status, StickerItem, User, channel_kind,
+    self, Channel, Emoji, Gif, Guild, Id, Member, Message, Reaction, Status, StickerItem, User, VoiceState,
+    channel_kind,
     commands::{self, SlashCommand},
     gateway::{self, Command, Event},
     proto::Folder,
@@ -23,6 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
+use crate::voice::{ServerInfo, VoiceConnection, VoiceEvent};
 
 mod demo;
 
@@ -59,6 +61,10 @@ pub enum StoreEvent {
     Typing(Id),
     Members(Id),
     Friends,
+    /// Voice connection, voice members or speaking indicators changed.
+    Voice,
+    /// Someone is ringing us in a direct-message call.
+    IncomingCall { channel: Id, title: String },
     /// The slash command list for a server or conversation arrived.
     Commands,
     /// An informational toast.
@@ -125,6 +131,45 @@ pub enum MemberRow {
     Placeholder,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct VoiceMember {
+    pub user: Id,
+    pub self_mute: bool,
+    pub self_deaf: bool,
+    pub mute: bool,
+    pub deaf: bool,
+    /// On a stage: in the audience.
+    pub suppress: bool,
+    pub hand_raised: bool,
+    pub video: bool,
+    pub streaming: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum VoiceStatus {
+    /// Waiting for Discord to assign a voice server.
+    Joining,
+    Connecting,
+    Connected,
+    Failed(String),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum VoiceModeration {
+    Mute(bool),
+    Deafen(bool),
+    Disconnect,
+}
+
+pub struct VoiceSession {
+    pub channel: Id,
+    pub guild: Option<Id>,
+    pub status: VoiceStatus,
+    session_id: Option<String>,
+    /// Token and endpoint from `VOICE_SERVER_UPDATE`.
+    server: Option<(String, String)>,
+}
+
 #[derive(Default)]
 pub struct ReadMarker {
     pub last_read: Option<Id>,
@@ -159,8 +204,18 @@ pub struct Store {
     pub member_lists: HashMap<Id, Vec<MemberRow>>,
     pub collapsed: std::collections::HashSet<Id>,
     pub show_members: bool,
-    /// Users connected to each voice channel.
-    pub voice: HashMap<Id, Vec<Id>>,
+    /// Who is connected to each voice channel (or direct-message call).
+    pub voice: HashMap<Id, Vec<VoiceMember>>,
+    pub voice_session: Option<VoiceSession>,
+    voice_conn: Option<VoiceConnection>,
+    voice_epoch: u64,
+    pub self_mute: bool,
+    pub self_deaf: bool,
+    pub speaking: std::collections::HashSet<Id>,
+    /// Direct-message calls in progress, with who is being rung.
+    pub calls: HashMap<Id, Vec<Id>>,
+    /// Live stages and their topics.
+    pub stages: HashMap<Id, String>,
     pub my_status: Status,
     gateway_session: String,
     /// Relationship type per user: 1 friend, 2 blocked, 3 incoming, 4 outgoing.
@@ -228,6 +283,14 @@ impl Store {
             collapsed: Default::default(),
             show_members: true,
             voice: HashMap::new(),
+            voice_session: None,
+            voice_conn: None,
+            voice_epoch: 0,
+            self_mute: false,
+            self_deaf: false,
+            speaking: Default::default(),
+            calls: HashMap::new(),
+            stages: HashMap::new(),
             my_status: Status::Online,
             gateway_session: String::new(),
             relationships: Vec::new(),
@@ -310,6 +373,7 @@ impl Store {
     }
 
     pub fn logout(&mut self, cx: &mut Context<Self>) {
+        self.leave_voice(cx);
         self.shutdown();
         // Keep the counter monotonic so work from the old session can never match a new one.
         let session = self.session + 1;
@@ -820,6 +884,398 @@ impl Store {
             if let Err(e) = result {
                 log::warn!("could not sync mute setting: {e}");
             }
+        });
+    }
+
+    // ---------------------------------------------------------------- voice
+
+    pub fn voice_members(&self, channel: Id) -> &[VoiceMember] {
+        self.voice.get(&channel).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn voice_member(&self, user: Id) -> Option<&VoiceMember> {
+        self.voice.values().flatten().find(|m| m.user == user)
+    }
+
+    fn channel_permissions(&self, channel: Id) -> u64 {
+        let Some(info) = self.channels.get(&channel) else { return 0 };
+        let Some(guild) = info.guild_id.and_then(|g| self.guild(g)) else { return permissions::ALL };
+        permissions::in_channel(&guild.guild, info, self.my_id(), &guild.own_roles)
+    }
+
+    pub fn has_permission(&self, channel: Id, permission: u64) -> bool {
+        self.channel_permissions(channel) & permission == permission
+    }
+
+    /// May move people on and off this stage.
+    pub fn is_stage_moderator(&self, channel: Id) -> bool {
+        let perms = self.channel_permissions(channel);
+        perms & (permissions::MANAGE_CHANNELS | permissions::MUTE_MEMBERS | permissions::MOVE_MEMBERS) != 0
+    }
+
+    /// Records someone's voice state, moving them out of any channel they left.
+    fn track_voice_state(&mut self, state: &VoiceState) {
+        let user = state.user_id;
+        let guild = state.guild_id;
+        let channels = &self.channels;
+        for (channel, members) in self.voice.iter_mut() {
+            // Only clear the user from channels in the same server (or calls, for DMs).
+            let same_scope = channels.get(channel).map(|c| c.guild_id) == Some(guild) || guild.is_none();
+            if same_scope {
+                members.retain(|m| m.user != user);
+            }
+        }
+        self.voice.retain(|_, members| !members.is_empty());
+        if let Some(channel) = state.channel_id {
+            let member = VoiceMember {
+                user,
+                self_mute: state.self_mute,
+                self_deaf: state.self_deaf,
+                mute: state.mute,
+                deaf: state.deaf,
+                suppress: state.suppress,
+                hand_raised: state.request_to_speak_timestamp.is_some(),
+                video: state.self_video,
+                streaming: state.self_stream,
+            };
+            self.voice.entry(channel).or_default().push(member);
+        }
+        if let (Some(guild), Some(member)) = (guild, &state.member) {
+            if let Some(user) = &member.user {
+                self.learn_member(guild, &user.clone(), member);
+            }
+        }
+    }
+
+    fn apply_voice_state(&mut self, state: VoiceState, cx: &mut Context<Self>) {
+        let mut state = state;
+        if state.guild_id.is_none() {
+            state.guild_id = state.channel_id.and_then(|c| self.channels.get(&c)).and_then(|c| c.guild_id);
+        }
+        self.track_voice_state(&state);
+        if state.user_id == self.my_id() {
+            if let Some(session) = self.voice_session.as_mut() {
+                match state.channel_id {
+                    Some(channel) => {
+                        // A moderator may have moved us; follow along.
+                        session.channel = channel;
+                        session.session_id = Some(state.session_id.clone());
+                        self.try_connect_voice(cx);
+                    }
+                    None if session.status != VoiceStatus::Joining => {
+                        self.end_voice(cx);
+                        cx.emit(StoreEvent::Notice("You were disconnected from voice.".into()));
+                    }
+                    None => {}
+                }
+            }
+        }
+        cx.emit(StoreEvent::Voice);
+    }
+
+    fn try_connect_voice(&mut self, cx: &mut Context<Self>) {
+        let me = self.my_id();
+        let Some(session) = self.voice_session.as_mut() else { return };
+        let (Some(session_id), Some((token, endpoint))) = (session.session_id.clone(), session.server.clone()) else {
+            return;
+        };
+        let Some(conn) = &self.voice_conn else { return };
+        conn.connect(ServerInfo {
+            channel: session.channel,
+            guild_or_channel: session.guild.unwrap_or(session.channel),
+            user: me,
+            session_id,
+            token,
+            endpoint,
+        });
+        session.status = VoiceStatus::Connecting;
+        cx.emit(StoreEvent::Voice);
+    }
+
+    fn send_voice_state(&self, channel: Option<Id>, guild: Option<Id>) {
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(Command::UpdateVoiceState {
+                guild_id: guild,
+                channel_id: channel,
+                self_mute: self.self_mute,
+                self_deaf: self.self_deaf,
+            });
+        }
+    }
+
+    fn start_voice_connection(&mut self, cx: &mut Context<Self>) {
+        let (tx, rx) = async_channel::unbounded();
+        let options = crate::settings::Settings::load().voice_options();
+        // Drop the old connection first so the audio devices are free.
+        self.voice_conn = None;
+        self.voice_conn =
+            Some(VoiceConnection::start(self.runtime.clone(), &options, self.my_id(), self.self_mute, self.self_deaf, tx));
+        self.voice_epoch += 1;
+        let epoch = self.voice_epoch;
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = rx.recv().await {
+                let alive = this.update(cx, |store, cx| {
+                    if store.voice_epoch != epoch {
+                        return false;
+                    }
+                    store.apply_voice_event(event, cx);
+                    true
+                });
+                if !matches!(alive, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn apply_voice_event(&mut self, event: VoiceEvent, cx: &mut Context<Self>) {
+        match event {
+            VoiceEvent::Connected => {
+                if let Some(session) = self.voice_session.as_mut() {
+                    session.status = VoiceStatus::Connected;
+                }
+            }
+            VoiceEvent::Disconnected(reason) => {
+                if let Some(session) = self.voice_session.as_mut() {
+                    session.status = VoiceStatus::Failed(reason);
+                }
+                self.speaking.clear();
+            }
+            VoiceEvent::Speaking(mut users) => {
+                if self.demo {
+                    // Keep the sample call lively.
+                    users.extend([Id(2), Id(4)]);
+                }
+                self.speaking = users;
+            }
+            VoiceEvent::DeviceProblem(problem) => cx.emit(StoreEvent::Error(problem)),
+        }
+        cx.emit(StoreEvent::Voice);
+    }
+
+    pub fn join_voice(&mut self, channel: Id, cx: &mut Context<Self>) {
+        let Some(info) = self.channels.get(&channel) else { return };
+        let guild = info.guild_id;
+        let is_stage = info.kind == channel_kind::STAGE;
+        if self.voice_session.as_ref().is_some_and(|s| s.channel == channel) {
+            return;
+        }
+        if guild.is_none() && self.rest.as_ref().is_some_and(|r| r.is_bot()) {
+            cx.emit(StoreEvent::Error("Bots cannot join direct-message calls.".into()));
+            return;
+        }
+        if guild.is_some() && !self.has_permission(channel, permissions::CONNECT) {
+            cx.emit(StoreEvent::Error("You do not have permission to join this channel.".into()));
+            return;
+        }
+        self.speaking.clear();
+        self.voice_session =
+            Some(VoiceSession { channel, guild, status: VoiceStatus::Joining, session_id: None, server: None });
+        self.start_voice_connection(cx);
+
+        if self.demo {
+            let state = VoiceState {
+                user_id: self.my_id(),
+                channel_id: Some(channel),
+                guild_id: guild,
+                self_mute: self.self_mute,
+                self_deaf: self.self_deaf,
+                suppress: is_stage,
+                ..Default::default()
+            };
+            self.track_voice_state(&state);
+            if let Some(session) = self.voice_session.as_mut() {
+                session.status = VoiceStatus::Connected;
+            }
+            // Sample conversation: someone is already talking.
+            self.speaking.insert(if is_stage { Id(4) } else { Id(2) });
+        } else {
+            self.send_voice_state(Some(channel), guild);
+        }
+        cx.emit(StoreEvent::Voice);
+    }
+
+    /// Starts a call in a direct message and rings the other people.
+    pub fn start_call(&mut self, channel: Id, cx: &mut Context<Self>) {
+        let already_running = self.calls.contains_key(&channel) || !self.voice_members(channel).is_empty();
+        self.join_voice(channel, cx);
+        if already_running || self.demo {
+            return;
+        }
+        let Some(rest) = self.rest.clone() else { return };
+        self.run(cx, async move { rest.ring(channel).await }, |_, result, _| {
+            if let Err(e) = result {
+                log::warn!("could not ring: {e}");
+            }
+        });
+    }
+
+    fn end_voice(&mut self, cx: &mut Context<Self>) {
+        self.voice_conn = None;
+        self.voice_epoch += 1;
+        self.speaking.clear();
+        if let Some(session) = self.voice_session.take() {
+            if self.demo {
+                let me = self.my_id();
+                if let Some(members) = self.voice.get_mut(&session.channel) {
+                    members.retain(|m| m.user != me);
+                }
+                self.voice.retain(|_, m| !m.is_empty());
+            }
+        }
+        cx.emit(StoreEvent::Voice);
+    }
+
+    pub fn leave_voice(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.voice_session.as_ref() else { return };
+        if !self.demo {
+            self.send_voice_state(None, session.guild);
+        }
+        self.end_voice(cx);
+    }
+
+    /// Applies our mute and deafen flags and shows them to other people.
+    fn announce_self_state(&mut self, cx: &mut Context<Self>) {
+        if let Some(conn) = &self.voice_conn {
+            conn.set_muted(self.self_mute);
+            conn.set_deafened(self.self_deaf);
+        }
+        if let Some(session) = &self.voice_session {
+            let (channel, guild) = (session.channel, session.guild);
+            if self.demo {
+                let me = self.my_id();
+                let (mute, deaf) = (self.self_mute, self.self_deaf);
+                if let Some(member) = self.voice.get_mut(&channel).and_then(|m| m.iter_mut().find(|m| m.user == me)) {
+                    member.self_mute = mute;
+                    member.self_deaf = deaf;
+                }
+            } else {
+                self.send_voice_state(Some(channel), guild);
+            }
+        }
+        cx.emit(StoreEvent::Voice);
+    }
+
+    pub fn toggle_self_mute(&mut self, cx: &mut Context<Self>) {
+        self.self_mute = !self.self_mute;
+        // Unmuting while deafened also undeafens, as in Discord.
+        if !self.self_mute {
+            self.self_deaf = false;
+        }
+        self.announce_self_state(cx);
+    }
+
+    pub fn toggle_self_deaf(&mut self, cx: &mut Context<Self>) {
+        self.self_deaf = !self.self_deaf;
+        self.self_mute = self.self_deaf;
+        self.announce_self_state(cx);
+    }
+
+    pub fn set_input_sensitivity(&mut self, db: f32) {
+        if let Some(conn) = &self.voice_conn {
+            conn.set_sensitivity(db);
+        }
+    }
+
+    /// Reopens the audio devices, e.g. after choosing different ones.
+    pub fn restart_voice_audio(&mut self, cx: &mut Context<Self>) {
+        if self.voice_session.is_none() {
+            return;
+        }
+        self.start_voice_connection(cx);
+        if !self.demo {
+            self.try_connect_voice(cx);
+        }
+    }
+
+    /// Runs a stage or voice moderation request.
+    fn voice_call<F>(&mut self, what: &'static str, cx: &mut Context<Self>, call: impl FnOnce(Rest) -> F + Send + 'static)
+    where
+        F: Future<Output = Result<()>> + Send + 'static,
+    {
+        let Some(rest) = self.rest.clone() else { return };
+        self.run(cx, async move { call(rest).await }, move |store, result, cx| {
+            store.report(result, what, cx);
+        });
+    }
+
+    /// Applies a voice change locally, for demo mode.
+    fn demo_voice_member(&mut self, user: Id, cx: &mut Context<Self>, change: impl FnOnce(&mut VoiceMember)) {
+        if let Some(member) = self.voice.values_mut().flatten().find(|m| m.user == user) {
+            change(member);
+        }
+        cx.emit(StoreEvent::Voice);
+    }
+
+    pub fn set_hand_raised(&mut self, channel: Id, raised: bool, cx: &mut Context<Self>) {
+        let Some(guild) = self.channels.get(&channel).and_then(|c| c.guild_id) else { return };
+        if self.demo {
+            let me = self.my_id();
+            return self.demo_voice_member(me, cx, |m| m.hand_raised = raised);
+        }
+        let stamp = raised.then(|| chrono::Utc::now().to_rfc3339());
+        let body = serde_json::json!({ "channel_id": channel.to_string(), "request_to_speak_timestamp": stamp });
+        self.voice_call("Could not update your request", cx, move |rest| async move {
+            rest.update_voice_state(guild, None, body).await
+        });
+    }
+
+    /// Moves someone (or ourselves, with `None`) on or off the stage.
+    pub fn set_on_stage(&mut self, channel: Id, user: Option<Id>, on_stage: bool, cx: &mut Context<Self>) {
+        let Some(guild) = self.channels.get(&channel).and_then(|c| c.guild_id) else { return };
+        if self.demo {
+            let target = user.unwrap_or(self.my_id());
+            return self.demo_voice_member(target, cx, |m| {
+                m.suppress = !on_stage;
+                m.hand_raised = false;
+            });
+        }
+        let mut body = serde_json::json!({ "channel_id": channel.to_string(), "suppress": !on_stage });
+        if on_stage && user.is_none() {
+            body["request_to_speak_timestamp"] = serde_json::Value::Null;
+        }
+        self.voice_call("Could not change who is on stage", cx, move |rest| async move {
+            rest.update_voice_state(guild, user, body).await
+        });
+    }
+
+    pub fn start_stage(&mut self, channel: Id, topic: String, cx: &mut Context<Self>) {
+        if self.demo {
+            self.stages.insert(channel, topic);
+            cx.emit(StoreEvent::Voice);
+            return;
+        }
+        self.voice_call("Could not start the stage", cx, move |rest| async move {
+            rest.start_stage(channel, &topic).await
+        });
+    }
+
+    pub fn end_stage(&mut self, channel: Id, cx: &mut Context<Self>) {
+        if self.demo {
+            self.stages.remove(&channel);
+            cx.emit(StoreEvent::Voice);
+            return;
+        }
+        self.voice_call("Could not end the stage", cx, move |rest| async move { rest.end_stage(channel).await });
+    }
+
+    /// Server mute, server deafen or disconnect someone in voice.
+    pub fn moderate_voice(&mut self, guild: Id, user: Id, change: VoiceModeration, cx: &mut Context<Self>) {
+        if self.demo {
+            return self.demo_voice_member(user, cx, |m| match change {
+                VoiceModeration::Mute(on) => m.mute = on,
+                VoiceModeration::Deafen(on) => m.deaf = on,
+                VoiceModeration::Disconnect => {}
+            });
+        }
+        let body = match change {
+            VoiceModeration::Mute(on) => serde_json::json!({ "mute": on }),
+            VoiceModeration::Deafen(on) => serde_json::json!({ "deaf": on }),
+            VoiceModeration::Disconnect => serde_json::json!({ "channel_id": null }),
+        };
+        self.voice_call("Could not update that member", cx, move |rest| async move {
+            rest.modify_member(guild, user, body).await
         });
     }
 
@@ -1642,10 +2098,12 @@ impl Store {
             channel.guild_id = Some(id);
             self.channels.insert(channel.id, channel);
         }
-        for state in std::mem::take(&mut guild.voice_states) {
-            if let Some(channel) = state.channel_id {
-                self.voice.entry(channel).or_default().push(state.user_id);
-            }
+        for mut state in std::mem::take(&mut guild.voice_states) {
+            state.guild_id = Some(id);
+            self.track_voice_state(&state);
+        }
+        for stage in std::mem::take(&mut guild.stage_instances) {
+            self.stages.insert(stage.channel_id, stage.topic);
         }
         let members = std::mem::take(&mut guild.members);
         match self.guild_mut(id) {
@@ -1862,21 +2320,46 @@ impl Store {
                 list.push(TypingUser { user: user_id, name, at: Instant::now() });
                 cx.emit(StoreEvent::Typing(channel_id));
             }
-            Event::VoiceState { user_id, channel_id, member } => {
-                for users in self.voice.values_mut() {
-                    users.retain(|u| *u != user_id);
+            Event::VoiceState(state) => self.apply_voice_state(*state, cx),
+            Event::VoiceServer { guild_id, channel_id, token, endpoint } => {
+                let Some(session) = self.voice_session.as_mut() else { return };
+                let ours = match session.guild {
+                    Some(guild) => guild_id == Some(guild),
+                    None => channel_id == Some(session.channel),
+                };
+                if !ours {
+                    return;
                 }
-                self.voice.retain(|_, users| !users.is_empty());
-                if let Some(channel) = channel_id {
-                    self.voice.entry(channel).or_default().push(user_id);
-                    let guild = self.channels.get(&channel).and_then(|c| c.guild_id);
-                    if let (Some(guild), Some(member)) = (guild, &member) {
-                        if let Some(user) = &member.user {
-                            self.learn_member(guild, &user.clone(), member);
-                        }
+                if let Some(endpoint) = endpoint {
+                    session.server = Some((token, endpoint));
+                    self.try_connect_voice(cx);
+                }
+            }
+            Event::Call { channel_id, ringing, ended } => {
+                if ended {
+                    self.calls.remove(&channel_id);
+                } else {
+                    let me = self.my_id();
+                    let in_call = self.voice_session.as_ref().is_some_and(|s| s.channel == channel_id);
+                    let was_ringing = self.calls.get(&channel_id).is_some_and(|r| r.contains(&me));
+                    if ringing.contains(&me) && !was_ringing && !in_call {
+                        let title = self
+                            .channels
+                            .get(&channel_id)
+                            .map(|c| self.channel_title(c))
+                            .unwrap_or_else(|| "Someone".into());
+                        cx.emit(StoreEvent::IncomingCall { channel: channel_id, title });
                     }
+                    self.calls.insert(channel_id, ringing);
                 }
-                cx.emit(StoreEvent::Channels);
+                cx.emit(StoreEvent::Voice);
+            }
+            Event::Stage { channel_id, topic } => {
+                match topic {
+                    Some(topic) => self.stages.insert(channel_id, topic),
+                    None => self.stages.remove(&channel_id),
+                };
+                cx.emit(StoreEvent::Voice);
             }
             Event::Relationship { id, user, kind } => {
                 if let Some(user) = user {
@@ -1946,6 +2429,8 @@ impl Store {
         self.read.clear();
         self.member_lists.clear();
         self.voice.clear();
+        self.stages.clear();
+        self.calls.clear();
         self.subscribed = None;
         for entry in self.messages.values_mut() {
             *entry = ChannelMessages::default();

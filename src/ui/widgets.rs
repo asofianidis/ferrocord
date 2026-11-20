@@ -82,6 +82,10 @@ pub fn badge(count: u32) -> impl IntoElement {
 
 /// A square, icon-only button. Attach `on_click` at the call site.
 pub fn icon_button(id: impl Into<ElementId>, name: IconName, tooltip: &'static str) -> Stateful<Div> {
+    icon_button_tinted(id, name, tooltip, theme::text_muted())
+}
+
+pub fn icon_button_tinted(id: impl Into<ElementId>, name: IconName, tooltip: &'static str, color: Hsla) -> Stateful<Div> {
     div()
         .id(id)
         .size(px(28.))
@@ -92,7 +96,7 @@ pub fn icon_button(id: impl Into<ElementId>, name: IconName, tooltip: &'static s
         .rounded_md()
         .cursor_pointer()
         .hover(|s| s.bg(theme::bg_active()))
-        .child(icon(name, 16., theme::text_muted()))
+        .child(icon(name, 16., color))
         .tooltip(tip(tooltip))
 }
 

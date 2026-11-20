@@ -1,6 +1,7 @@
 //! The message pane: header, virtualized message list and composer.
 
 use super::{
+    call,
     members::bot_tag,
     rich::{self, Reveal},
     theme,
@@ -127,6 +128,7 @@ pub struct ChatView {
     flash: Option<Id>,
     post_title: Entity<InputState>,
     post_body: Entity<InputState>,
+    stage_topic: Entity<InputState>,
     last_typing: Option<Instant>,
     _subs: Vec<Subscription>,
 }
@@ -141,6 +143,7 @@ impl ChatView {
         let picker_query = cx.new(|cx| InputState::new(window, cx).placeholder("Find an emoji"));
         let post_title = cx.new(|cx| InputState::new(window, cx).placeholder("Post title"));
         let post_body = cx.new(|cx| InputState::new(window, cx).placeholder("Say something to start the post"));
+        let stage_topic = cx.new(|cx| InputState::new(window, cx).placeholder("Stage topic"));
         let subs = vec![
             cx.subscribe_in(&store, window, Self::on_store_event),
             cx.subscribe_in(&composer, window, Self::on_input),
@@ -178,6 +181,7 @@ impl ChatView {
             flash: None,
             post_title,
             post_body,
+            stage_topic,
             last_typing: None,
             _subs: subs,
         };
@@ -257,7 +261,7 @@ impl ChatView {
                 self.sync_channel(window, cx);
                 cx.notify();
             }
-            StoreEvent::Channels => cx.notify(),
+            StoreEvent::Channels | StoreEvent::Voice => cx.notify(),
             StoreEvent::Commands => {
                 self.completion = self.compute_completion(cx);
                 cx.notify();
@@ -1873,6 +1877,8 @@ impl ChatView {
         };
         let members_shown = store.show_members;
         let pins_shown = self.panel.as_ref().is_some_and(|p| p.kind == PanelKind::Pins);
+        let is_dm = channel.is_some_and(|c| c.is_dm());
+        let is_bot = store.me.as_ref().is_some_and(|u| u.bot);
 
         h_flex()
             .h(px(48.))
@@ -1927,6 +1933,14 @@ impl ChatView {
                             .prefix(icon(IconName::Search, 14., theme::text_muted())),
                     ),
                 )
+                .when(is_dm && !is_bot, |d| {
+                    d.child(icon_button("call", IconName::Phone, "Start voice call").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            let Some(channel) = this.channel else { return };
+                            this.store.update(cx, |store, cx| store.start_call(channel, cx));
+                        },
+                    )))
+                })
                 .child(
                     icon_button("pins", IconName::Pin, "Pinned messages")
                         .when(pins_shown, |b| b.bg(theme::bg_active()))
@@ -2190,6 +2204,16 @@ impl Render for ChatView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity();
         let has_channel = self.channel.is_some();
+        let call_panel = self.channel.and_then(|channel| {
+            let view = this.clone();
+            let on_profile: call::OnProfile = Rc::new(move |user, cx| {
+                view.update(cx, |this, cx| {
+                    this.profile = Some(user);
+                    cx.notify();
+                });
+            });
+            call::call_panel(&self.store, channel, &self.stage_topic, on_profile, cx)
+        });
 
         let is_forum =
             self.channel.and_then(|c| self.store.read(cx).channels.get(&c)).is_some_and(|c| c.is_forum());
@@ -2265,6 +2289,7 @@ impl Render for ChatView {
                 }
             }))
             .child(self.render_header(cx))
+            .children(call_panel)
             .child(list)
             .when(!is_forum, |d| d.child(self.render_composer(cx)))
             .when_some(self.completion.as_ref(), |d, completion| d.child(self.render_completion(completion, cx)))

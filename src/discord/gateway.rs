@@ -71,7 +71,13 @@ pub enum Event {
     MemberList(Value),
     MembersChunk { guild_id: Id, members: Vec<Member>, presences: Vec<(Id, Status)> },
     OwnMemberUpdate { guild_id: Id, roles: Vec<Id> },
-    VoiceState { user_id: Id, channel_id: Option<Id>, member: Option<Member> },
+    VoiceState(Box<VoiceState>),
+    /// Where to connect for voice. `endpoint` is `None` while Discord picks a server.
+    VoiceServer { guild_id: Option<Id>, channel_id: Option<Id>, token: String, endpoint: Option<String> },
+    /// A direct-message call started, changed (`ringing`) or ended.
+    Call { channel_id: Id, ringing: Vec<Id>, ended: bool },
+    /// A stage went live or changed topic; `None` when it ended.
+    Stage { channel_id: Id, topic: Option<String> },
     PollVote { channel_id: Id, message_id: Id, user_id: Id, answer_id: u32, added: bool },
     /// `kind` is `None` when the relationship was removed.
     Relationship { id: Id, user: Option<User>, kind: Option<u8> },
@@ -83,6 +89,8 @@ pub enum Command {
     /// Ask the gateway for the member list of a guild channel.
     SubscribeMembers { guild_id: Id, channel_id: Id },
     SetStatus(Status),
+    /// Join, move within or (with no channel) leave voice.
+    UpdateVoiceState { guild_id: Option<Id>, channel_id: Option<Id>, self_mute: bool, self_deaf: bool },
     Shutdown,
 }
 
@@ -239,6 +247,18 @@ async fn connect(
                     None | Some(Command::Shutdown) => {
                         let _ = ws.close(None).await;
                         return Outcome::Shutdown;
+                    }
+                    Some(Command::UpdateVoiceState { guild_id, channel_id, self_mute, self_deaf }) => {
+                        let payload = json!({ "op": 4, "d": {
+                            "guild_id": guild_id.map(|g| g.to_string()),
+                            "channel_id": channel_id.map(|c| c.to_string()),
+                            "self_mute": self_mute,
+                            "self_deaf": self_deaf,
+                            "self_video": false,
+                        }});
+                        if let Err(e) = ws.send(WsMessage::text(payload.to_string())).await {
+                            return reconnect(format!("send failed: {e}"));
+                        }
                     }
                     Some(Command::SetStatus(status)) => {
                         let payload = json!({ "op": 3, "d": {
@@ -497,11 +517,23 @@ fn dispatch(state: &mut State, kind: &str, mut d: Value) -> Vec<Event> {
         }
         "RELATIONSHIP_REMOVE" => one(id_of(&d["id"]).map(|id| Event::Relationship { id, user: None, kind: None })),
         "USER_GUILD_SETTINGS_UPDATE" => vec![Event::Mutes(parse_mutes(&d))],
-        "VOICE_STATE_UPDATE" => {
-            let Some(user_id) = id_of(&d["user_id"]) else { return vec![] };
-            let channel_id = id_of(&d["channel_id"]);
-            let member = serde_json::from_value(d["member"].take()).ok();
-            vec![Event::VoiceState { user_id, channel_id, member }]
+        "VOICE_STATE_UPDATE" => one(parse::<VoiceState>(d, kind).map(|v| Event::VoiceState(Box::new(v)))),
+        "VOICE_SERVER_UPDATE" => vec![Event::VoiceServer {
+            guild_id: id_of(&d["guild_id"]),
+            channel_id: id_of(&d["channel_id"]),
+            token: d["token"].as_str().unwrap_or_default().to_string(),
+            endpoint: d["endpoint"].as_str().filter(|e| !e.is_empty()).map(str::to_string),
+        }],
+        "CALL_CREATE" | "CALL_UPDATE" | "CALL_DELETE" => one(id_of(&d["channel_id"]).map(|channel_id| Event::Call {
+            channel_id,
+            ringing: d["ringing"].as_array().map(|a| a.iter().filter_map(id_of).collect()).unwrap_or_default(),
+            ended: kind == "CALL_DELETE",
+        })),
+        "STAGE_INSTANCE_CREATE" | "STAGE_INSTANCE_UPDATE" | "STAGE_INSTANCE_DELETE" => {
+            one(id_of(&d["channel_id"]).map(|channel_id| Event::Stage {
+                channel_id,
+                topic: (kind != "STAGE_INSTANCE_DELETE").then(|| d["topic"].as_str().unwrap_or_default().to_string()),
+            }))
         }
         "GUILD_MEMBER_LIST_UPDATE" => vec![Event::MemberList(d)],
         "GUILD_MEMBERS_CHUNK" => {
@@ -759,6 +791,39 @@ mod tests {
         assert_eq!(m.content, "hi");
         assert!(m.referenced_message.is_none());
         assert_eq!(m.time().timestamp(), 1_767_323_045);
+    }
+
+    #[test]
+    fn voice_events_parse() {
+        let mut state = state();
+        let events = dispatch(
+            &mut state,
+            "VOICE_STATE_UPDATE",
+            json!({
+                "guild_id": "10", "channel_id": "20", "user_id": "1", "session_id": "abc",
+                "self_mute": true, "self_deaf": false, "mute": false, "deaf": false, "suppress": true,
+                "request_to_speak_timestamp": "2026-01-01T00:00:00Z", "self_video": false,
+            }),
+        );
+        let [Event::VoiceState(v)] = events.as_slice() else { panic!("expected voice state") };
+        assert_eq!((v.channel_id, v.session_id.as_str(), v.self_mute, v.suppress), (Some(Id(20)), "abc", true, true));
+        assert!(v.request_to_speak_timestamp.is_some());
+
+        let events = dispatch(
+            &mut state,
+            "VOICE_SERVER_UPDATE",
+            json!({ "token": "t", "guild_id": "10", "endpoint": "c-ams.discord.media:443" }),
+        );
+        let [Event::VoiceServer { guild_id, endpoint, token, .. }] = events.as_slice() else { panic!() };
+        assert_eq!((guild_id, endpoint.as_deref(), token.as_str()), (&Some(Id(10)), Some("c-ams.discord.media:443"), "t"));
+
+        let pending = dispatch(&mut state, "VOICE_SERVER_UPDATE", json!({ "token": "t", "guild_id": "10", "endpoint": null }));
+        assert!(matches!(&pending[0], Event::VoiceServer { endpoint: None, .. }));
+
+        let call = dispatch(&mut state, "CALL_CREATE", json!({ "channel_id": "30", "ringing": ["1", "2"] }));
+        assert!(matches!(&call[0], Event::Call { channel_id: Id(30), ringing, ended: false } if ringing.len() == 2));
+        let stage = dispatch(&mut state, "STAGE_INSTANCE_DELETE", json!({ "channel_id": "40", "topic": "x" }));
+        assert!(matches!(&stage[0], Event::Stage { channel_id: Id(40), topic: None }));
     }
 
     #[test]

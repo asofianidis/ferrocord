@@ -15,22 +15,81 @@ pub enum SettingsEvent {
 pub struct SettingsView {
     store: Entity<Store>,
     themes: Vec<Palette>,
+    saved: settings::Settings,
+    /// Audio devices, listed in the background when the dialog opens.
+    devices: Option<crate::voice::Devices>,
 }
+
+const SENSITIVITY: [(&str, f32); 4] =
+    [("Very sensitive", -60.0), ("Sensitive", -50.0), ("Normal", -40.0), ("Only loud speech", -30.0)];
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
 
 impl SettingsView {
     pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
-        Self { store, themes: theme::load_all(settings::themes_dir().as_deref()) }
+        cx.spawn(async move |this, cx| {
+            let devices = cx.background_executor().spawn(async { crate::voice::list_devices() }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.devices = Some(devices);
+                cx.notify();
+            });
+        })
+        .detach();
+        Self {
+            store,
+            themes: theme::load_all(settings::themes_dir().as_deref()),
+            saved: settings::Settings::load(),
+            devices: None,
+        }
     }
 
     fn choose(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(palette) = self.themes.get(ix) else { return };
         theme::apply(palette, cx);
         let id = palette.id.clone();
+        self.saved.theme = id.clone();
         settings::Settings::update(|s| s.theme = id);
         cx.notify();
+    }
+
+    fn set_device(&mut self, input: bool, name: Option<String>, cx: &mut Context<Self>) {
+        if input {
+            self.saved.input_device = name.clone();
+        } else {
+            self.saved.output_device = name.clone();
+        }
+        settings::Settings::update(|s| {
+            if input {
+                s.input_device = name;
+            } else {
+                s.output_device = name;
+            }
+        });
+        self.store.update(cx, |store, cx| store.restart_voice_audio(cx));
+        cx.notify();
+    }
+
+    fn device_list(&self, input: bool, cx: &mut Context<Self>) -> AnyElement {
+        let Some(devices) = &self.devices else {
+            return div().text_color(theme::text_muted()).child("Looking for audio devices\u{2026}").into_any_element();
+        };
+        let names = if input { &devices.inputs } else { &devices.outputs };
+        let current = if input { &self.saved.input_device } else { &self.saved.output_device };
+        let key = if input { "in" } else { "out" };
+        let mut options = vec![(None, "System default".to_string())];
+        options.extend(names.iter().map(|n| (Some(n.clone()), n.clone())));
+        h_flex()
+            .flex_wrap()
+            .gap_2()
+            .children(options.into_iter().enumerate().map(|(ix, (value, label))| {
+                let selected = *current == value;
+                Self::pill(SharedString::from(format!("{key}-device-{ix}")), label, selected)
+                    .max_w(px(280.))
+                    .truncate()
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_device(input, value.clone(), cx)))
+            }))
+            .into_any_element()
     }
 
     fn open_themes_folder(&mut self, cx: &mut Context<Self>) {
@@ -235,6 +294,25 @@ impl Render for SettingsView {
                                     .child("Custom themes are JSON files; the folder has an example."),
                             ),
                     )
+                    .child(Self::section("VOICE"))
+                    .child(div().text_size(px(12.)).text_color(theme::text_muted()).child("Microphone"))
+                    .child(self.device_list(true, cx))
+                    .child(div().text_size(px(12.)).text_color(theme::text_muted()).child("Output"))
+                    .child(self.device_list(false, cx))
+                    .child(div().text_size(px(12.)).text_color(theme::text_muted()).child("Input sensitivity"))
+                    .child(h_flex().flex_wrap().gap_2().children(SENSITIVITY.into_iter().enumerate().map(
+                        |(ix, (label, db))| {
+                            let selected = (self.saved.input_sensitivity_db - db).abs() < 0.5;
+                            Self::pill(("sensitivity", ix), label, selected).on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.saved.input_sensitivity_db = db;
+                                    settings::Settings::update(|s| s.input_sensitivity_db = db);
+                                    this.store.update(cx, |store, _| store.set_input_sensitivity(db));
+                                    cx.notify();
+                                },
+                            ))
+                        },
+                    )))
                     .child(Self::section("STATUS"))
                     .child(h_flex().gap_2().children(
                         [Status::Online, Status::Idle, Status::Dnd, Status::Offline].into_iter().enumerate().map(

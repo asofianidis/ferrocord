@@ -7,6 +7,7 @@ mod http;
 mod markdown;
 mod settings;
 mod store;
+mod voice;
 mod ui;
 
 use gpui::{prelude::*, *};

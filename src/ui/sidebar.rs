@@ -1,6 +1,6 @@
 //! Channel list (or direct-message list) and the current-user panel.
 
-use super::{theme, widgets::*};
+use super::{call, theme, widgets::*};
 use crate::{
     discord::{Id, channel_kind},
     store::{ChannelRow, RowKind, Store, StoreEvent},
@@ -22,6 +22,7 @@ impl Sidebar {
             if matches!(
                 event,
                 StoreEvent::Guilds
+                    | StoreEvent::Voice
                     | StoreEvent::Friends
                     | StoreEvent::Channels
                     | StoreEvent::Selection
@@ -45,17 +46,20 @@ impl Sidebar {
                     Some(user) => (store.display_name(guild, user), user.avatar_url(64)),
                     None => ("Unknown user".to_string(), String::new()),
                 };
+                let speaking = store.speaking.contains(&id);
+                let flags = store.voice_member(id).map(call::voice_flags);
                 out.push(
                     h_flex()
                         .w_full()
                         .h(px(32.))
-                        .pl(px(42.))
+                        .pl(px(38.))
                         .pr_2()
-                        .gap_2()
+                        .gap_1p5()
                         .text_size(px(13.))
-                        .text_color(theme::text_muted())
-                        .child(avatar(url, 20.))
+                        .text_color(if speaking { theme::text_bright() } else { theme::text_muted() })
+                        .child(call::voice_avatar(url, 18., speaking))
                         .child(div().flex_1().min_w_0().truncate().child(name))
+                        .children(flags)
                         .into_any_element(),
                 );
                 continue;
@@ -103,6 +107,7 @@ impl Sidebar {
             let mentions = store.mentions(id);
             let is_thread = row.kind == RowKind::Thread;
             let muted = store.muted.contains(&id);
+            let is_voice = channel.is_voice();
             let color = if selected || unread { theme::text_bright() } else { theme::text_muted() };
             out.push(
                 div()
@@ -144,7 +149,12 @@ impl Sidebar {
                             .when(mentions > 0, |d| d.child(badge(mentions))),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.store.update(cx, |store, cx| store.select_channel(id, cx));
+                        this.store.update(cx, |store, cx| {
+                            store.select_channel(id, cx);
+                            if is_voice {
+                                store.join_voice(id, cx);
+                            }
+                        });
                     }))
                     .context_menu({
                         let store = self.store.clone();
@@ -267,7 +277,9 @@ impl Sidebar {
 
 impl Render for Sidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let voice_panel = call::connection_panel(&self.store, cx);
         let store = self.store.read(cx);
+        let (self_mute, self_deaf) = (store.self_mute, store.self_deaf);
         let guild = store.selected_guild.and_then(|id| store.guild(id));
 
         let (title, list) = match guild {
@@ -289,7 +301,7 @@ impl Render for Sidebar {
                     {
                         rows.push(*row);
                         for user in occupants.into_iter().flatten() {
-                            rows.push(ChannelRow { id: *user, kind: RowKind::VoiceUser });
+                            rows.push(ChannelRow { id: user.user, kind: RowKind::VoiceUser });
                         }
                     }
                 }
@@ -363,6 +375,7 @@ impl Render for Sidebar {
                     .child(div().flex_1().min_w_0().truncate().child(title)),
             )
             .child(list)
+            .children(voice_panel)
             .when_some(me, |d, me| {
                 d.child(
                     h_flex()
@@ -391,6 +404,28 @@ impl Render for Sidebar {
                                 .child(
                                     div().truncate().text_size(px(12.)).text_color(theme::text_muted()).child(me.tag()),
                                 ),
+                        )
+                        .child(
+                            icon_button_tinted(
+                                "self-mute",
+                                if self_mute { IconName::MicOff } else { IconName::Mic },
+                                if self_mute { "Unmute" } else { "Mute" },
+                                if self_mute { theme::danger() } else { theme::text_muted() },
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.store.update(cx, |store, cx| store.toggle_self_mute(cx));
+                            })),
+                        )
+                        .child(
+                            icon_button_tinted(
+                                "self-deaf",
+                                if self_deaf { IconName::HeadphoneOff } else { IconName::Headphones },
+                                if self_deaf { "Undeafen" } else { "Deafen" },
+                                if self_deaf { theme::danger() } else { theme::text_muted() },
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.store.update(cx, |store, cx| store.toggle_self_deaf(cx));
+                            })),
                         )
                         .child(icon_button("settings", IconName::Settings, "Settings (Ctrl+,)").on_click(
                             |_, window, cx| window.dispatch_action(Box::new(super::ToggleSettings), cx),

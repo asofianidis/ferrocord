@@ -37,7 +37,9 @@ The official client is an Electron app: high memory use, slow startup, and a slu
 - Friends page with pending requests and blocked users; add, accept, remove and block
 - Group conversations, profile cards with roles, presence, and your own status
 - Typing indicators and the member list with role colours
-- Who is in each voice channel (viewing only)
+- Voice channels and direct-message calls: join, leave, mute, deafen, speaking indicators, and microphone and speaker selection with an adjustable input sensitivity
+- Stage channels: speakers and audience, raising your hand, and for moderators inviting speakers, moving people to the audience, and starting or ending the stage
+- Voice moderation: server mute, server deafen and disconnect
 
 **App**
 - Themes, including your own
@@ -50,7 +52,11 @@ Discord only offers some features to user accounts: search, friends, GIF search,
 
 ### Not implemented
 
-Voice, video and screen sharing. This needs its own audio pipeline (capture, playback, Opus, the voice UDP transport and Discord's end-to-end encryption) and is the one large area left. Also not present: stage channel controls, server and role administration, account profile editing, and file options for slash commands.
+Video, camera and screen sharing. Voice is built on songbird, which handles audio only, so video would need its own transport, codecs and DAVE frame encryption. Also not present: server and role administration, account profile editing, and file options for slash commands.
+
+### About voice
+
+Voice uses Discord's voice protocol with DAVE end-to-end encryption, via songbird. The audio side (devices, capture, playback, voice activity) is tested on this machine. Connecting to a real Discord voice server has not been tested yet. If it fails, the call panel shows the reason.
 
 ## Themes
 

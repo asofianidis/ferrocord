@@ -6,6 +6,18 @@ pub const VIEW_CHANNEL: u64 = 1 << 10;
 pub const SEND_MESSAGES: u64 = 1 << 11;
 pub const MANAGE_MESSAGES: u64 = 1 << 13;
 pub const ADMINISTRATOR: u64 = 1 << 3;
+pub const KICK_MEMBERS: u64 = 1 << 1;
+pub const BAN_MEMBERS: u64 = 1 << 2;
+pub const MANAGE_CHANNELS: u64 = 1 << 4;
+pub const MANAGE_GUILD: u64 = 1 << 5;
+pub const CONNECT: u64 = 1 << 20;
+pub const SPEAK: u64 = 1 << 21;
+pub const MUTE_MEMBERS: u64 = 1 << 22;
+pub const DEAFEN_MEMBERS: u64 = 1 << 23;
+pub const MOVE_MEMBERS: u64 = 1 << 24;
+pub const MANAGE_NICKNAMES: u64 = 1 << 27;
+pub const MANAGE_ROLES: u64 = 1 << 28;
+pub const MODERATE_MEMBERS: u64 = 1 << 40;
 pub const ALL: u64 = u64::MAX;
 
 pub fn base(guild: &Guild, user: Id, member_roles: &[Id]) -> u64 {

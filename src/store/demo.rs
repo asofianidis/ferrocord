@@ -15,7 +15,13 @@ impl Store {
             user(6, "Margaret", false),
         ];
         let member = |u: &serde_json::Value, roles: &[&str], nick: Option<&str>| json!({ "user": u, "roles": roles, "nick": nick });
-        let everyone_view = (permissions::VIEW_CHANNEL | permissions::SEND_MESSAGES).to_string();
+        let everyone_view = (permissions::VIEW_CHANNEL
+            | permissions::SEND_MESSAGES
+            | permissions::CONNECT
+            | permissions::SPEAK
+            | 1 << 32)
+            .to_string();
+        let maintainer = (permissions::MUTE_MEMBERS | permissions::MOVE_MEMBERS | permissions::MANAGE_CHANNELS).to_string();
 
         let guild = |id: u64, name: &str, channels: serde_json::Value| {
             json!({
@@ -24,7 +30,7 @@ impl Store {
                 "owner_id": "2",
                 "roles": [
                     { "id": id.to_string(), "name": "@everyone", "permissions": everyone_view, "position": 0 },
-                    { "id": (id + 1).to_string(), "name": "Maintainers", "color": 0x34b3a0, "position": 2, "hoist": true, "permissions": "0" },
+                    { "id": (id + 1).to_string(), "name": "Maintainers", "color": 0x34b3a0, "position": 2, "hoist": true, "permissions": maintainer },
                     { "id": (id + 2).to_string(), "name": "Contributors", "color": 0xe0a458, "position": 1, "permissions": "0" },
                 ],
                 "channels": channels,
@@ -33,7 +39,7 @@ impl Store {
                     { "id": (id + 51).to_string(), "name": "Ship it", "format_type": 1 },
                 ],
                 "members": [
-                    member(&me, &[], None),
+                    member(&me, &[&(id + 1).to_string()], None),
                     member(&people[0], &[&(id + 1).to_string()], None),
                     member(&people[1], &[&(id + 2).to_string()], Some("linus (kernel)")),
                     member(&people[2], &[&(id + 1).to_string()], None),
@@ -63,6 +69,7 @@ impl Store {
                     channel(122, 0, "help", Some(120), 1),
                     channel(123, 0, "showcase", Some(120), 2),
                     channel(124, 2, "Voice Lounge", Some(120), 3),
+                    channel(125, 13, "Town Hall", Some(120), 4),
                     channel(130, 4, "Development", None, 2),
                     channel(131, 0, "gpui", Some(130), 0),
                     channel(132, 0, "async", Some(130), 1),
@@ -200,7 +207,7 @@ impl Store {
         }
         let list: Vec<_> = batch.into_iter().map(|m| self.make_msg(m)).collect();
         self.messages.insert(Id(121), ChannelMessages { list, loaded: true, loading: false, reached_start: true });
-        for id in [111, 112, 122, 123, 124, 131, 132, 1331, 1332, 210, 211, 310, 400, 401, 402] {
+        for id in [111, 112, 122, 123, 124, 125, 131, 132, 1331, 1332, 210, 211, 310, 400, 401, 402] {
             self.messages.insert(Id(id), ChannelMessages { loaded: true, reached_start: true, ..Default::default() });
         }
 
@@ -227,7 +234,18 @@ impl Store {
             vec![TypingUser { user: Id(3), name: "linus (kernel)".into(), at: Instant::now() + Duration::from_secs(3600) }],
         );
 
-        self.voice.insert(Id(124), vec![Id(2), Id(3)]);
+        let member = |user: u64, self_mute: bool| VoiceMember { user: Id(user), self_mute, ..Default::default() };
+        self.voice.insert(Id(124), vec![member(2, false), member(3, true)]);
+        // A live stage with one speaker, one raised hand and a listener.
+        self.stages.insert(Id(125), "Q&A: async Rust in practice".into());
+        self.voice.insert(
+            Id(125),
+            vec![
+                VoiceMember { user: Id(4), ..Default::default() },
+                VoiceMember { user: Id(6), suppress: true, hand_raised: true, ..Default::default() },
+                VoiceMember { user: Id(5), suppress: true, ..Default::default() },
+            ],
+        );
         self.select_channel(Id(121), cx);
         cx.emit(StoreEvent::Members(Id(100)));
         cx.emit(StoreEvent::Messages { channel: Id(121), change: MessageChange::Reset });

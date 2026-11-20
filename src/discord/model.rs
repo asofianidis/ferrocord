@@ -259,6 +259,10 @@ impl Channel {
         matches!(self.kind, ANNOUNCEMENT_THREAD | PUBLIC_THREAD | PRIVATE_THREAD)
     }
 
+    pub fn is_voice(&self) -> bool {
+        matches!(self.kind, channel_kind::VOICE | channel_kind::STAGE)
+    }
+
     pub fn is_dm(&self) -> bool {
         matches!(self.kind, channel_kind::DM | channel_kind::GROUP_DM)
     }
@@ -328,6 +332,8 @@ pub struct Guild {
     pub voice_states: Vec<VoiceState>,
     #[serde(default, deserialize_with = "de_null")]
     pub stickers: Vec<StickerItem>,
+    #[serde(default, deserialize_with = "de_null")]
+    pub stage_instances: Vec<StageInstance>,
 }
 
 /// A GIF search result.
@@ -359,6 +365,37 @@ pub struct VoiceState {
     pub user_id: Id,
     #[serde(default)]
     pub channel_id: Option<Id>,
+    #[serde(default)]
+    pub guild_id: Option<Id>,
+    #[serde(default, deserialize_with = "de_null")]
+    pub session_id: String,
+    #[serde(default, deserialize_with = "de_null")]
+    pub self_mute: bool,
+    #[serde(default, deserialize_with = "de_null")]
+    pub self_deaf: bool,
+    #[serde(default, deserialize_with = "de_null")]
+    pub mute: bool,
+    #[serde(default, deserialize_with = "de_null")]
+    pub deaf: bool,
+    /// On a stage: in the audience rather than speaking.
+    #[serde(default, deserialize_with = "de_null")]
+    pub suppress: bool,
+    #[serde(default, deserialize_with = "de_null")]
+    pub self_video: bool,
+    #[serde(default, deserialize_with = "de_null")]
+    pub self_stream: bool,
+    /// Set while a stage audience member has their hand raised.
+    #[serde(default)]
+    pub request_to_speak_timestamp: Option<String>,
+    #[serde(default)]
+    pub member: Option<Member>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct StageInstance {
+    pub channel_id: Id,
+    #[serde(default, deserialize_with = "de_null")]
+    pub topic: String,
 }
 
 impl Guild {

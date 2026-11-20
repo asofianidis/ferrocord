@@ -27,6 +27,10 @@ env_logger = "0.11"
 open = "5"
 dirs = "6"
 base64 = "0.22"
+songbird = { version = "0.6.1", default-features = false, features = ["driver", "gateway", "receive", "tungstenite", "native"] }
+symphonia-core = "0.5"
+cpal = "0.16"
+async-trait = "0.1"
 
 [profile.dev]
 opt-level = 1
