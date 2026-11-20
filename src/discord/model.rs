@@ -326,6 +326,32 @@ pub struct Guild {
     pub unavailable: bool,
     #[serde(default, deserialize_with = "de_null")]
     pub voice_states: Vec<VoiceState>,
+    #[serde(default, deserialize_with = "de_null")]
+    pub stickers: Vec<StickerItem>,
+}
+
+/// A GIF search result.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Gif {
+    /// The link that is sent as the message.
+    #[serde(default, deserialize_with = "de_null")]
+    pub url: String,
+    #[serde(default, deserialize_with = "de_null")]
+    pub gif_src: String,
+    #[serde(default, deserialize_with = "de_null")]
+    pub src: String,
+    #[serde(default, deserialize_with = "de_null")]
+    pub preview: String,
+    #[serde(default, deserialize_with = "de_null")]
+    pub width: u32,
+    #[serde(default, deserialize_with = "de_null")]
+    pub height: u32,
+}
+
+impl Gif {
+    pub fn thumbnail(&self) -> &str {
+        [&self.preview, &self.gif_src, &self.src].into_iter().find(|s| !s.is_empty()).map_or("", |s| s.as_str())
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

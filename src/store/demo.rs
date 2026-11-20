@@ -28,6 +28,10 @@ impl Store {
                     { "id": (id + 2).to_string(), "name": "Contributors", "color": 0xe0a458, "position": 1, "permissions": "0" },
                 ],
                 "channels": channels,
+                "stickers": [
+                    { "id": (id + 50).to_string(), "name": "Ferris wave", "format_type": 1 },
+                    { "id": (id + 51).to_string(), "name": "Ship it", "format_type": 1 },
+                ],
                 "members": [
                     member(&me, &[], None),
                     member(&people[0], &[&(id + 1).to_string()], None),

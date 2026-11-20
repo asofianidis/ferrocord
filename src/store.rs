@@ -5,7 +5,7 @@
 //! fine-grained [`StoreEvent`]s so that only the affected view re-renders.
 
 use crate::discord::{
-    self, Channel, Emoji, Guild, Id, Member, Message, Reaction, Status, User, channel_kind,
+    self, Channel, Emoji, Gif, Guild, Id, Member, Message, Reaction, Status, StickerItem, User, channel_kind,
     gateway::{self, Command, Event},
     permissions,
     rest::{Rest, Upload},
@@ -883,6 +883,66 @@ impl Store {
         self.run(cx, async move { rest.create_post(forum, &title, &content).await }, move |store, result, cx| {
             if let Some(thread) = store.report(result, "Could not create post", cx) {
                 store.adopt_thread(thread, forum, cx);
+            }
+        });
+    }
+
+    // ---------------------------------------------------------------- GIFs and stickers
+
+    pub fn search_gifs(
+        &mut self,
+        query: String,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(Result<Vec<Gif>, String>, &mut gpui::App) + 'static,
+    ) {
+        let unavailable = if self.demo {
+            Some("GIF search needs a signed-in account.")
+        } else if self.rest.as_ref().is_none_or(|r| r.is_bot()) {
+            Some("GIF search is not available to bot accounts.")
+        } else {
+            None
+        };
+        if let Some(reason) = unavailable {
+            cx.defer(move |cx| then(Err(reason.to_string()), cx));
+            return;
+        }
+        let Some(rest) = self.rest.clone() else { return };
+        self.run(cx, async move { rest.gifs(&query).await }, move |_, result, cx| {
+            then(result.map_err(|e| e.to_string()), cx);
+        });
+    }
+
+    /// Stickers of the channel's server.
+    pub fn stickers(&self, channel: Id) -> Vec<StickerItem> {
+        self.channels
+            .get(&channel)
+            .and_then(|c| c.guild_id)
+            .and_then(|g| self.guild(g))
+            .map(|g| g.guild.stickers.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn send_sticker(&mut self, channel: Id, sticker: StickerItem, cx: &mut Context<Self>) {
+        if self.demo {
+            let Some(me) = self.me.clone() else { return };
+            let local = Message {
+                id: Id::now(),
+                channel_id: channel,
+                author: me,
+                sticker_items: vec![sticker],
+                ..Default::default()
+            };
+            let msg = self.make_msg(local);
+            self.messages.entry(channel).or_default().list.push(msg);
+            cx.emit(StoreEvent::Messages { channel, change: MessageChange::Appended(1) });
+            return;
+        }
+        let Some(rest) = self.rest.clone() else { return };
+        let nonce = Id::now();
+        let id = sticker.id;
+        self.run(cx, async move { rest.send_sticker(channel, id, nonce).await }, move |store, result, cx| {
+            if let Some(sent) = store.report(result, "Could not send sticker", cx) {
+                store.insert_message(sent, Some(nonce), cx);
             }
         });
     }

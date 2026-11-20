@@ -1,6 +1,6 @@
 //! Minimal Discord REST client with rate-limit handling.
 
-use super::model::{Channel, Id, Message};
+use super::model::{Channel, Gif, Id, Message};
 use anyhow::{Result, anyhow};
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde_json::{Value, json};
@@ -310,6 +310,24 @@ impl Rest {
         };
         self.send(|| self.request(Method::PATCH, &path).json(&body)).await?;
         Ok(())
+    }
+
+    /// Searches GIFs, or lists trending ones for an empty query. User accounts only.
+    pub async fn gifs(&self, query: &str) -> Result<Vec<Gif>> {
+        let path = if query.is_empty() {
+            "/gifs/trending-gifs?provider=tenor&locale=en-US&media_format=gif".to_string()
+        } else {
+            format!("/gifs/search?q={}&media_format=gif&provider=tenor&locale=en-US", percent_encode(query))
+        };
+        let body: Value = self.send(|| self.request(Method::GET, &path)).await?.json().await?;
+        let list = body.as_array().cloned().unwrap_or_default();
+        Ok(list.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect())
+    }
+
+    pub async fn send_sticker(&self, channel: Id, sticker: Id, nonce: Id) -> Result<Message> {
+        let path = format!("/channels/{channel}/messages");
+        let body = json!({ "content": "", "sticker_ids": [sticker.to_string()], "nonce": nonce.to_string() });
+        Ok(self.send(|| self.request(Method::POST, &path).json(&body)).await?.json().await?)
     }
 
     pub async fn open_dm(&self, user: Id) -> Result<Channel> {

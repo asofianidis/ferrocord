@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     discord::{
-        Attachment, Component, Embed, Emoji, Id, Message, Poll, channel_kind, component_kind, message_kind,
+        Attachment, Component, Embed, Emoji, Gif, Id, Message, Poll, channel_kind, component_kind, message_kind,
         rest::Upload,
     },
     emoji, markdown,
@@ -59,6 +59,20 @@ enum PickerTarget {
     React(Id),
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum PickerTab {
+    Emoji,
+    Gifs,
+    Stickers,
+}
+
+enum GifState {
+    Idle,
+    Loading,
+    Loaded(Vec<Gif>),
+    Failed(String),
+}
+
 #[derive(Clone)]
 enum Visual {
     Avatar(String),
@@ -102,6 +116,8 @@ pub struct ChatView {
     search: Entity<InputState>,
     picker: Option<PickerTarget>,
     picker_query: Entity<InputState>,
+    picker_tab: PickerTab,
+    gifs: GifState,
     completion: Option<Completion>,
     /// Friendly text inserted by autocomplete, with what to send instead.
     replacements: Vec<(String, String)>,
@@ -132,10 +148,10 @@ impl ChatView {
                     this.run_search(cx);
                 }
             }),
-            cx.subscribe(&picker_query, |_, _, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    cx.notify();
-                }
+            cx.subscribe(&picker_query, |this, _, event: &InputEvent, cx| match event {
+                InputEvent::Change => cx.notify(),
+                InputEvent::PressEnter { .. } if this.picker_tab == PickerTab::Gifs => this.load_gifs(cx),
+                _ => {}
             }),
         ];
         let mut this = Self {
@@ -152,6 +168,8 @@ impl ChatView {
             search,
             picker: None,
             picker_query,
+            picker_tab: PickerTab::Emoji,
+            gifs: GifState::Idle,
             completion: None,
             replacements: Vec::new(),
             profile: None,
@@ -789,7 +807,9 @@ impl ChatView {
             self.composer.update(cx, |s, cx| s.focus(window, cx));
         } else {
             self.picker = Some(target);
+            self.picker_tab = PickerTab::Emoji;
             self.picker_query.update(cx, |s, cx| {
+                s.set_placeholder("Find an emoji", window, cx);
                 s.set_value("", window, cx);
                 s.focus(window, cx);
             });
@@ -823,7 +843,180 @@ impl ChatView {
         cx.notify();
     }
 
-    fn render_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn load_gifs(&mut self, cx: &mut Context<Self>) {
+        let query = self.picker_query.read(cx).value().trim().to_string();
+        self.gifs = GifState::Loading;
+        cx.notify();
+        let this = cx.weak_entity();
+        self.store.update(cx, |store, cx| {
+            store.search_gifs(query, cx, move |result, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    this.gifs = match result {
+                        Ok(list) => GifState::Loaded(list),
+                        Err(reason) => GifState::Failed(reason),
+                    };
+                    cx.notify();
+                });
+            });
+        });
+    }
+
+    fn set_picker_tab(&mut self, tab: PickerTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.picker_tab = tab;
+        self.picker_query.update(cx, |s, cx| {
+            let placeholder = match tab {
+                PickerTab::Emoji => "Find an emoji",
+                PickerTab::Gifs => "Search GIFs, then press Enter",
+                PickerTab::Stickers => "Find a sticker",
+            };
+            s.set_placeholder(placeholder, window, cx);
+            s.set_value("", window, cx);
+            s.focus(window, cx);
+        });
+        if tab == PickerTab::Gifs {
+            self.load_gifs(cx);
+        }
+        cx.notify();
+    }
+
+    /// The Emoji / GIFs / Stickers switch, shown when picking for the composer.
+    fn picker_tabs(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.picker != Some(PickerTarget::Composer) {
+            return None;
+        }
+        let current = self.picker_tab;
+        let tabs = [("Emoji", PickerTab::Emoji), ("GIFs", PickerTab::Gifs), ("Stickers", PickerTab::Stickers)];
+        Some(h_flex().gap_1().children(tabs.into_iter().enumerate().map(|(ix, (label, tab))| {
+            div()
+                .id(("picker-tab", ix))
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(13.))
+                .when(tab == current, |d| d.bg(theme::bg_active()).text_color(theme::text_bright()))
+                .hover(|s| s.bg(theme::bg_hover()))
+                .child(label)
+                .on_click(cx.listener(move |this, _, window, cx| this.set_picker_tab(tab, window, cx)))
+        })))
+    }
+
+    fn picker_shell() -> Stateful<Div> {
+        v_flex()
+            .id("picker")
+            .absolute()
+            .bottom(px(88.))
+            .right(px(16.))
+            .w(px(348.))
+            .h(px(400.))
+            .p_2()
+            .gap_1()
+            .occlude()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme::border())
+            .bg(theme::bg_sidebar())
+            .shadow_lg()
+    }
+
+    fn render_media_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        let tabs = self.picker_tabs(cx);
+        let note = |text: String| div().p_2().text_color(theme::text_muted()).child(text);
+        let mut body = v_flex().id("media-scroll").flex_1().min_h_0().overflow_y_scroll();
+
+        if self.picker_tab == PickerTab::Gifs {
+            match &self.gifs {
+                GifState::Idle | GifState::Loading => body = body.child(note("Loading\u{2026}".into())),
+                GifState::Failed(reason) => body = body.child(note(reason.clone())),
+                GifState::Loaded(list) if list.is_empty() => body = body.child(note("No GIFs found.".into())),
+                GifState::Loaded(list) => {
+                    body = body.child(h_flex().flex_wrap().items_start().gap_1().children(
+                        list.iter().take(40).enumerate().map(|(ix, gif)| {
+                            let url = gif.url.clone();
+                            let ratio = if gif.width == 0 { 0.75 } else { gif.height as f32 / gif.width as f32 };
+                            div()
+                                .id(("gif", ix))
+                                .w(px(162.))
+                                .h(px((162. * ratio).clamp(60., 200.)))
+                                .rounded_md()
+                                .overflow_hidden()
+                                .cursor_pointer()
+                                .bg(theme::bg_code())
+                                .hover(|s| s.opacity(0.85))
+                                .child(img(gif.thumbnail().to_string()).size_full().object_fit(ObjectFit::Cover))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let Some(channel) = this.channel else { return };
+                                    let url = url.clone();
+                                    this.picker = None;
+                                    this.store.update(cx, |s, cx| s.send_message(channel, url, None, Vec::new(), cx));
+                                    this.composer.update(cx, |s, cx| s.focus(window, cx));
+                                    cx.notify();
+                                }))
+                        }),
+                    ));
+                }
+            }
+        } else {
+            let query = self.picker_query.read(cx).value().trim().to_lowercase();
+            let stickers: Vec<_> = self
+                .channel
+                .map(|c| self.store.read(cx).stickers(c))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|s| s.name.to_lowercase().contains(&query))
+                .collect();
+            if stickers.is_empty() {
+                body = body.child(note("This server has no stickers to show.".into()));
+            }
+            body = body.child(h_flex().flex_wrap().items_start().gap_1().children(
+                stickers.into_iter().enumerate().map(|(ix, sticker)| {
+                    let name = sticker.name.clone();
+                    let label = name.clone();
+                    let visual = match sticker.image_url() {
+                        Some(url) => img(url)
+                            .size(px(88.))
+                            .object_fit(ObjectFit::Contain)
+                            .with_fallback(move || {
+                                div()
+                                    .size(px(88.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(12.))
+                                    .text_color(theme::text_muted())
+                                    .child(label.clone())
+                                    .into_any_element()
+                            })
+                            .into_any_element(),
+                        None => div().size(px(88.)).child(label).into_any_element(),
+                    };
+                    div()
+                        .id(("sticker", ix))
+                        .p_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::bg_active()))
+                        .child(visual)
+                        .tooltip(tip(name))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let Some(channel) = this.channel else { return };
+                            let sticker = sticker.clone();
+                            this.picker = None;
+                            this.store.update(cx, |s, cx| s.send_sticker(channel, sticker, cx));
+                            this.composer.update(cx, |s, cx| s.focus(window, cx));
+                            cx.notify();
+                        }))
+                }),
+            ));
+        }
+        Self::picker_shell().children(tabs).child(Input::new(&self.picker_query)).child(body).into_any_element()
+    }
+
+    fn render_picker(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.picker == Some(PickerTarget::Composer) && self.picker_tab != PickerTab::Emoji {
+            return self.render_media_picker(cx);
+        }
+        let tabs = self.picker_tabs(cx);
         let store = self.store.read(cx);
         let query = self.picker_query.read(cx).value().trim().trim_matches(':').to_lowercase();
         let guild = self.channel.and_then(|c| store.channels.get(&c)).and_then(|c| c.guild_id).and_then(|g| store.guild(g));
@@ -895,23 +1088,7 @@ impl ChatView {
             body = body.child(div().p_2().text_color(theme::text_muted()).child("No emoji match."));
         }
 
-        v_flex()
-            .id("picker")
-            .absolute()
-            .bottom(px(88.))
-            .right(px(16.))
-            .w(px(348.))
-            .h(px(380.))
-            .p_2()
-            .gap_1()
-            .occlude()
-            .rounded_lg()
-            .border_1()
-            .border_color(theme::border())
-            .bg(theme::bg_sidebar())
-            .shadow_lg()
-            .child(Input::new(&self.picker_query))
-            .child(body)
+        Self::picker_shell().children(tabs).child(Input::new(&self.picker_query)).child(body).into_any_element()
     }
 
     fn render_completion(&self, completion: &Completion, cx: &mut Context<Self>) -> impl IntoElement {
