@@ -1,6 +1,7 @@
 //! Top-level window content.
 
 mod call;
+mod channel_permissions;
 mod chat;
 pub mod form;
 mod friends;
@@ -42,6 +43,8 @@ pub struct AppView {
     _form_sub: Option<Subscription>,
     server_settings: Option<Entity<server_settings::ServerSettings>>,
     _server_settings_sub: Option<Subscription>,
+    channel_permissions: Option<Entity<channel_permissions::ChannelPermissions>>,
+    _channel_permissions_sub: Option<Subscription>,
     _subs: Vec<Subscription>,
 }
 
@@ -125,6 +128,8 @@ impl AppView {
             _form_sub: None,
             server_settings: None,
             _server_settings_sub: None,
+            channel_permissions: None,
+            _channel_permissions_sub: None,
             _subs: subs,
         }
     }
@@ -148,6 +153,18 @@ impl AppView {
             cx.notify();
         }));
         self.server_settings = Some(view);
+        cx.notify();
+    }
+
+    pub fn show_channel_permissions(&mut self, channel: crate::discord::Id, cx: &mut Context<Self>) {
+        let view = cx.new(|cx| channel_permissions::ChannelPermissions::new(self.store.clone(), channel, cx));
+        self._channel_permissions_sub =
+            Some(cx.subscribe(&view, |this, _, _: &channel_permissions::ChannelPermissionsEvent, cx| {
+                this.channel_permissions = None;
+                this._channel_permissions_sub = None;
+                cx.notify();
+            }));
+        self.channel_permissions = Some(view);
         cx.notify();
     }
 
@@ -267,6 +284,7 @@ impl Render for AppView {
             .capture_action(cx.listener(|this, _: &input::Escape, _, cx| {
                 if this.lightbox.take().is_some()
                     || this.form.take().is_some()
+                    || this.channel_permissions.take().is_some()
                     || this.server_settings.take().is_some()
                     || this.settings.take().is_some()
                 {
@@ -341,6 +359,7 @@ impl Render for AppView {
         body.children(self.switcher.clone())
             .children(self.settings.clone())
             .children(self.server_settings.clone())
+            .children(self.channel_permissions.clone())
             .children(self.form.clone())
             .children(lightbox)
     }

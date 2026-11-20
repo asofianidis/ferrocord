@@ -1,9 +1,13 @@
-//! Server settings: overview, roles and bans.
+//! Server settings: overview, roles, bans and the audit log.
 
 use super::{form, theme, widgets::*};
 use crate::{
-    discord::{Ban, Id, permissions as p},
-    store::{Store, StoreEvent, image_mime},
+    discord::{
+        Ban, Id,
+        audit::{self, TargetKind},
+        permissions as p,
+    },
+    store::{AuditLog, Store, StoreEvent, image_mime},
 };
 use gpui::{prelude::*, *};
 use gpui_component::input::{Input, InputState};
@@ -18,13 +22,14 @@ enum Tab {
     Overview,
     Roles,
     Bans,
+    AuditLog,
 }
 
 const ROLE_COLORS: [u32; 12] = [
     0, 0x1abc9c, 0x2ecc71, 0x3498db, 0x9b59b6, 0xe91e63, 0xf1c40f, 0xe67e22, 0xe74c3c, 0x95a5a6, 0x607d8b, 0xd4387c,
 ];
 
-const PERMISSIONS: [(&str, u64); 32] = [
+pub(super) const PERMISSIONS: [(&str, u64); 32] = [
     ("Administrator", p::ADMINISTRATOR),
     ("View Channels", p::VIEW_CHANNEL),
     ("Manage Channels", p::MANAGE_CHANNELS),
@@ -70,6 +75,7 @@ pub struct ServerSettings {
     permissions: u64,
     hoist: bool,
     bans: Option<Vec<Ban>>,
+    audit: Option<AuditLog>,
     _subs: Vec<Subscription>,
 }
 
@@ -101,6 +107,7 @@ impl ServerSettings {
             permissions: 0,
             hoist: false,
             bans: None,
+            audit: None,
             _subs: subs,
         }
     }
@@ -120,6 +127,18 @@ impl ServerSettings {
 
     fn open_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
         self.tab = tab;
+        if tab == Tab::AuditLog && self.audit.is_none() {
+            let this = cx.weak_entity();
+            let guild = self.guild;
+            self.store.update(cx, |store, cx| {
+                store.fetch_audit_log(guild, cx, move |log, cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        this.audit = Some(log);
+                        cx.notify();
+                    });
+                });
+            });
+        }
         if tab == Tab::Bans && self.bans.is_none() {
             let this = cx.weak_entity();
             let guild = self.guild;
@@ -245,9 +264,10 @@ impl ServerSettings {
         let Some(guild) = store.guild(self.guild) else { return div().into_any_element() };
         let can_manage = store.can(self.guild, p::MANAGE_ROLES);
         let top = store.top_role_position(self.guild);
-        let mut roles = guild.guild.roles.clone();
-        roles.sort_by_key(|r| std::cmp::Reverse(r.position));
         let everyone = self.guild;
+        let mut roles = store.ordered_roles(self.guild);
+        roles.extend(guild.guild.roles.iter().find(|r| r.id == everyone).cloned());
+        let movable = roles.len().saturating_sub(1);
         let editing = self.role.and_then(|id| roles.iter().find(|r| r.id == id)).cloned();
         let editable = editing.as_ref().is_some_and(|r| can_manage && (r.position < top || r.id == everyone));
 
@@ -274,10 +294,16 @@ impl ServerSettings {
                     },
                 )))
             })
-            .children(roles.iter().map(|role| {
+            .children(roles.iter().enumerate().map(|(ix, role)| {
                 let id = role.id;
                 let selected = self.role == Some(id);
                 let label = if id == everyone { "@everyone".to_string() } else { role.name.clone() };
+                // Arrows show on the selected role when it can move and stays below ours.
+                let can_move = |other: Option<&crate::discord::Role>| {
+                    can_manage && id != everyone && role.position < top && other.is_some_and(|o| o.position < top)
+                };
+                let up = selected && ix > 0 && can_move(roles.get(ix - 1));
+                let down = selected && ix + 1 < movable && can_move(roles.get(ix + 1));
                 h_flex()
                     .id(("role", id.0))
                     .px_2()
@@ -292,7 +318,29 @@ impl ServerSettings {
                     } else {
                         theme::c(role.color)
                     }))
-                    .child(div().min_w_0().truncate().child(label))
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .when(up, |d| {
+                        d.child(
+                            icon_button(("role-up", id.0), IconName::ChevronUp, "Move up").size(px(20.)).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    let guild = this.guild;
+                                    this.store.update(cx, |s, cx| s.move_role(guild, id, true, cx));
+                                }),
+                            ),
+                        )
+                    })
+                    .when(down, |d| {
+                        d.child(
+                            icon_button(("role-down", id.0), IconName::ChevronDown, "Move down").size(px(20.)).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    let guild = this.guild;
+                                    this.store.update(cx, |s, cx| s.move_role(guild, id, false, cx));
+                                }),
+                            ),
+                        )
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| this.select_role(id, window, cx)))
             }));
 
@@ -454,6 +502,77 @@ impl ServerSettings {
     }
 }
 
+impl ServerSettings {
+    fn render_audit(&self, cx: &mut Context<Self>) -> AnyElement {
+        let store = self.store.read(cx);
+        if !store.can(self.guild, 1 << 7) {
+            return div().text_color(theme::text_muted()).child("You need View Audit Log to see this.").into_any_element();
+        }
+        let Some(log) = &self.audit else {
+            return div().text_color(theme::text_muted()).child("Loading the audit log\u{2026}").into_any_element();
+        };
+        if log.entries.is_empty() {
+            return div().text_color(theme::text_muted()).child("Nothing has been logged yet.").into_any_element();
+        }
+        let guild = store.guild(self.guild);
+        let name_target = |entry: &audit::AuditEntry, kind: TargetKind| -> Option<String> {
+            let target = entry.target?;
+            match kind {
+                TargetKind::Channel | TargetKind::Thread => store
+                    .channels
+                    .get(&target)
+                    .and_then(|c| c.name.clone())
+                    .map(|n| format!("#{n}"))
+                    .or(Some("a deleted channel".into())),
+                TargetKind::Role => guild
+                    .and_then(|g| g.guild.roles.iter().find(|r| r.id == target))
+                    .map(|r| format!("@{}", r.name))
+                    .or(Some("a deleted role".into())),
+                TargetKind::User => log
+                    .users
+                    .get(&target)
+                    .or_else(|| store.users.get(&target))
+                    .map(|u| u.display_name().to_string()),
+                _ => None,
+            }
+        };
+        v_flex()
+            .gap_1()
+            .children(log.entries.iter().map(|entry| {
+                let (verb, kind) = audit::describe(entry.action);
+                let who = entry.user.as_ref().map_or_else(|| "Someone".to_string(), |u| u.display_name().to_string());
+                let target = name_target(entry, kind);
+                let mut line = format!("{who} {verb}");
+                if let Some(target) = target {
+                    line.push(' ');
+                    line.push_str(&target);
+                }
+                let mut detail = vec![entry.id.time().format("%b %-d, %H:%M").to_string()];
+                if !entry.changed.is_empty() {
+                    detail.push(format!("changed {}", entry.changed.join(", ").replace('_', " ")));
+                }
+                if let Some(reason) = &entry.reason {
+                    detail.push(format!("reason: {reason}"));
+                }
+                h_flex()
+                    .px_2()
+                    .py_1p5()
+                    .gap_3()
+                    .rounded_md()
+                    .hover(|s| s.bg(theme::bg_hover()))
+                    .child(avatar(entry.user.as_ref().map(|u| u.avatar_url(64)).unwrap_or_default(), 28.))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().text_color(theme::text_bright()).child(line))
+                            .child(div().text_size(px(12.)).text_color(theme::text_muted()).child(detail.join(" \u{b7} "))),
+                    )
+            }))
+            .into_any_element()
+    }
+}
+
 /// The preset colours, plus the role's own colour if it is not one of them.
 fn swatches(current: u32) -> Vec<u32> {
     let mut colors = ROLE_COLORS.to_vec();
@@ -481,11 +600,13 @@ impl Render for ServerSettings {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let name = self.store.read(cx).guild(self.guild).map(|g| g.guild.name.clone()).unwrap_or_default();
         let tab = self.tab;
-        let tabs = [("Overview", Tab::Overview), ("Roles", Tab::Roles), ("Bans", Tab::Bans)];
+        let tabs =
+            [("Overview", Tab::Overview), ("Roles", Tab::Roles), ("Bans", Tab::Bans), ("Audit Log", Tab::AuditLog)];
         let body = match tab {
             Tab::Overview => self.render_overview(cx),
             Tab::Roles => self.render_roles(cx),
             Tab::Bans => self.render_bans(cx),
+            Tab::AuditLog => self.render_audit(cx),
         };
         div()
             .id("server-settings-backdrop")

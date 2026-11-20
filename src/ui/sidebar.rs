@@ -78,6 +78,7 @@ impl Sidebar {
                 let collapsed = store.collapsed.contains(&id);
                 let category_admin =
                     channel.guild_id.filter(|g| store.can(*g, permissions::MANAGE_CHANNELS));
+                let can_override = channel.guild_id.is_some_and(|g| store.can(g, permissions::MANAGE_ROLES));
                 let row =
                     h_flex()
                         .id(("category", id.0))
@@ -108,7 +109,7 @@ impl Sidebar {
                             let menu = menu.item(PopupMenuItem::new("Create Channel").on_click(move |_, window, cx| {
                                 form::open_form(create_channel_form(create.clone(), guild, Some(id)), window, cx);
                             }));
-                            channel_admin_items(menu, store.clone(), id, true)
+                            channel_admin_items(menu, store.clone(), id, true, can_override)
                         })
                         .into_any_element()
                     }
@@ -128,6 +129,7 @@ impl Sidebar {
             let muted = store.muted.contains(&id);
             let is_voice = channel.is_voice();
             let can_manage = channel.guild_id.is_some_and(|g| store.can(g, permissions::MANAGE_CHANNELS));
+            let can_override = channel.guild_id.is_some_and(|g| store.can(g, permissions::MANAGE_ROLES));
             let color = if selected || unread { theme::text_bright() } else { theme::text_muted() };
             out.push(
                 div()
@@ -195,7 +197,7 @@ impl Sidebar {
                                 cx.write_to_clipboard(ClipboardItem::new_string(id.to_string()));
                             }));
                             if can_manage {
-                                menu = channel_admin_items(menu, store, id, false);
+                                menu = channel_admin_items(menu, store, id, false, can_override);
                             }
                             menu
                         }
@@ -508,10 +510,14 @@ fn channel_admin_items(
     store: Entity<Store>,
     id: Id,
     is_category: bool,
+    can_override: bool,
 ) -> gpui_component::menu::PopupMenu {
     let (edit, delete) = (store.clone(), store);
     let noun = if is_category { "Category" } else { "Channel" };
     menu.separator()
+        .when(can_override, |m| {
+            m.item(PopupMenuItem::new("Permissions").on_click(move |_, _, cx| form::open_channel_permissions(id, cx)))
+        })
         .item(PopupMenuItem::new(format!("Edit {noun}")).on_click(move |_, window, cx| {
             let Some(channel) = edit.read(cx).channels.get(&id).cloned() else { return };
             let has_topic = channel.is_text_like() && !channel.is_voice() && !is_category;

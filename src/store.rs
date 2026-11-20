@@ -5,7 +5,7 @@
 //! fine-grained [`StoreEvent`]s so that only the affected view re-renders.
 
 use crate::discord::{
-    self, Ban, Channel, Emoji, Gif, Guild, Id, Member, Message, Reaction, Role, Status, StickerItem, User,
+    self, Ban, Channel, Emoji, Gif, Guild, Id, Member, Message, Overwrite, Reaction, Role, Status, StickerItem, User,
     VoiceState, channel_kind,
     commands::{self, SlashCommand},
     gateway::{self, Command, Event},
@@ -239,6 +239,12 @@ pub struct Store {
 }
 
 impl EventEmitter<StoreEvent> for Store {}
+
+pub struct AuditLog {
+    pub entries: Vec<discord::audit::AuditEntry>,
+    /// Users the log mentions, for naming targets.
+    pub users: HashMap<Id, User>,
+}
 
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct Profile {
@@ -1210,6 +1216,117 @@ impl Store {
             "name": name, "color": color, "permissions": permissions.to_string(), "hoist": hoist,
         });
         self.admin("Could not save the role", cx, move |rest| async move { rest.modify_role(guild, role, body).await }, apply);
+    }
+
+    /// Roles from highest to lowest, without @everyone, in Discord's order
+    /// (ties on position go to the older role).
+    pub fn ordered_roles(&self, guild: Id) -> Vec<Role> {
+        let Some(state) = self.guild(guild) else { return Vec::new() };
+        let mut roles: Vec<Role> = state.guild.roles.iter().filter(|r| r.id != guild).cloned().collect();
+        roles.sort_by(|a, b| b.position.cmp(&a.position).then(a.id.cmp(&b.id)));
+        roles
+    }
+
+    /// Swaps a role with the one above (`up`) or below it.
+    pub fn move_role(&mut self, guild: Id, role: Id, up: bool, cx: &mut Context<Self>) {
+        let top = self.top_role_position(guild);
+        let mut order = self.ordered_roles(guild);
+        let Some(ix) = order.iter().position(|r| r.id == role) else { return };
+        let other = if up { ix.checked_sub(1) } else { Some(ix + 1).filter(|&o| o < order.len()) };
+        let Some(other) = other else { return };
+        if order[ix].position >= top || order[other].position >= top {
+            cx.emit(StoreEvent::Error("You can only move roles below your highest role.".into()));
+            return;
+        }
+        order.swap(ix, other);
+        // Renumber from the bottom (@everyone is 0), sending only what moved.
+        let count = order.len() as i32;
+        let moved: Vec<Role> = order
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, mut r)| {
+                let position = count - i as i32;
+                (r.position != position).then(|| {
+                    r.position = position;
+                    r
+                })
+            })
+            .collect();
+        for r in &moved {
+            self.upsert_role(guild, r.clone(), cx);
+        }
+        if self.demo {
+            return;
+        }
+        let body: Vec<_> =
+            moved.iter().map(|r| serde_json::json!({ "id": r.id.to_string(), "position": r.position })).collect();
+        let body = serde_json::Value::Array(body);
+        self.admin("Could not move the role", cx, move |rest| async move { rest.reorder_roles(guild, body).await }, move |store, roles, cx| {
+            for r in roles {
+                store.upsert_role(guild, r, cx);
+            }
+        });
+    }
+
+    fn set_overwrite_locally(&mut self, channel: Id, target: Id, overwrite: Option<Overwrite>, cx: &mut Context<Self>) {
+        if let Some(c) = self.channels.get_mut(&channel) {
+            c.permission_overwrites.retain(|o| o.id != target);
+            c.permission_overwrites.extend(overwrite);
+        }
+        cx.emit(StoreEvent::Channels);
+        cx.notify();
+    }
+
+    /// Creates or replaces a role's or member's permission override on a channel.
+    pub fn save_overwrite(&mut self, channel: Id, overwrite: Overwrite, cx: &mut Context<Self>) {
+        let target = overwrite.id;
+        let saved = overwrite.clone();
+        let apply = move |store: &mut Self, _: (), cx: &mut Context<Self>| {
+            store.set_overwrite_locally(channel, target, Some(saved), cx);
+            cx.emit(StoreEvent::Notice("Permissions saved.".into()));
+        };
+        if self.demo {
+            return apply(self, (), cx);
+        }
+        let body = serde_json::json!({
+            "type": overwrite.kind,
+            "allow": overwrite.allow.to_string(),
+            "deny": overwrite.deny.to_string(),
+        });
+        self.admin("Could not save the permissions", cx, move |rest| async move { rest.set_overwrite(channel, target, body).await }, apply);
+    }
+
+    pub fn delete_overwrite(&mut self, channel: Id, target: Id, cx: &mut Context<Self>) {
+        let apply = move |store: &mut Self, _: (), cx: &mut Context<Self>| store.set_overwrite_locally(channel, target, None, cx);
+        if self.demo {
+            return apply(self, (), cx);
+        }
+        self.admin("Could not remove the override", cx, move |rest| async move { rest.delete_overwrite(channel, target).await }, apply);
+    }
+
+    /// Loads the most recent audit log entries.
+    pub fn fetch_audit_log(&mut self, guild: Id, cx: &mut Context<Self>, then: impl FnOnce(AuditLog, &mut gpui::App) + 'static) {
+        let finish = move |log: serde_json::Value, cx: &mut Context<Self>| {
+            let log = AuditLog {
+                entries: discord::audit::parse(&log),
+                users: discord::audit::users(&log).into_iter().map(|u| (u.id, u)).collect(),
+            };
+            cx.defer(move |cx| then(log, cx));
+        };
+        if self.demo {
+            let me = self.me.as_ref().map(|u| serde_json::json!({ "id": u.id.to_string(), "username": u.username }));
+            let first_channel = self.channels.values().find(|c| c.guild_id == Some(guild)).map(|c| c.id.to_string());
+            let sample = serde_json::json!({
+                "users": [me, { "id": "77", "username": "spammer" }],
+                "audit_log_entries": [
+                    { "id": Id::now().to_string(), "user_id": "1", "target_id": "77", "action_type": 22, "reason": "Spam" },
+                    { "id": Id(Id::now().0 - (3_600_000 << 22)).to_string(), "user_id": "1", "target_id": first_channel,
+                      "action_type": 11, "changes": [{ "key": "topic" }] },
+                ],
+            });
+            return finish(sample, cx);
+        }
+        self.admin("Could not load the audit log", cx, move |rest| async move { rest.audit_log(guild).await }, move |_, log, cx| finish(log, cx));
     }
 
     pub fn delete_role(&mut self, guild: Id, role: Id, cx: &mut Context<Self>) {

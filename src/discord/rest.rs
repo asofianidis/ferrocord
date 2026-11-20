@@ -421,6 +421,30 @@ impl Rest {
         Ok(())
     }
 
+    /// Moves roles; `body` is a list of `{ id, position }`.
+    pub async fn reorder_roles(&self, guild: Id, body: Value) -> Result<Vec<Role>> {
+        let path = format!("/guilds/{guild}/roles");
+        Ok(self.send(|| self.request(Method::PATCH, &path).json(&body)).await?.json().await?)
+    }
+
+    /// Creates or replaces a channel's permission override for a role or member.
+    pub async fn set_overwrite(&self, channel: Id, target: Id, body: Value) -> Result<()> {
+        let path = format!("/channels/{channel}/permissions/{target}");
+        self.send(|| self.request(Method::PUT, &path).json(&body)).await?;
+        Ok(())
+    }
+
+    pub async fn delete_overwrite(&self, channel: Id, target: Id) -> Result<()> {
+        let path = format!("/channels/{channel}/permissions/{target}");
+        self.send(|| self.request(Method::DELETE, &path)).await?;
+        Ok(())
+    }
+
+    pub async fn audit_log(&self, guild: Id) -> Result<Value> {
+        let path = format!("/guilds/{guild}/audit-logs?limit=100");
+        Ok(self.send(|| self.request(Method::GET, &path)).await?.json().await?)
+    }
+
     pub async fn create_role(&self, guild: Id, body: Value) -> Result<Role> {
         let path = format!("/guilds/{guild}/roles");
         Ok(self.send(|| self.request(Method::POST, &path).json(&body)).await?.json().await?)
