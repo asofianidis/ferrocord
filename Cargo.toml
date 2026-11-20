@@ -2,5 +2,38 @@
 name = "ferrocord"
 version = "0.1.0"
 edition = "2024"
+description = "A fast, native Discord client written in Rust"
 
 [dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.12" }
+gpui-component = "0.10.0"
+gpui-kit = "0.10.0"
+http = "1"
+futures = "0.3"
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio-tungstenite = { version = "0.30", features = ["native-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json", "multipart", "http2", "gzip"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+chrono = "0.4"
+async-channel = "2"
+keyring = { version = "3", features = ["windows-native", "apple-native", "sync-secret-service"] }
+parking_lot = "0.12"
+log = "0.4"
+env_logger = "0.11"
+open = "5"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
