@@ -41,6 +41,12 @@ The official client is an Electron app: high memory use, slow startup, and a slu
 - Stage channels: speakers and audience, raising your hand, and for moderators inviting speakers, moving people to the audience, and starting or ending the stage
 - Voice moderation: server mute, server deafen and disconnect
 
+**Server administration**
+- Server settings: name, icon, and the ban list with unbanning
+- Create, rename, retopic and delete channels and categories
+- Roles: create, rename, recolour, reorder visibility, edit permissions and delete
+- Members: change nicknames, add and remove roles, time out, kick and ban, limited to what your permissions allow
+
 **App**
 - Themes, including your own
 - Leave a server, close a conversation, copy an invite link
@@ -52,7 +58,7 @@ Discord only offers some features to user accounts: search, friends, GIF search,
 
 ### Not implemented
 
-Video, camera and screen sharing. Voice is built on songbird, which handles audio only, so video would need its own transport, codecs and DAVE frame encryption. Also not present: server and role administration, account profile editing, and file options for slash commands.
+Video, camera and screen sharing. Voice is built on songbird, which handles audio only, so video would need its own transport, codecs and DAVE frame encryption. Also not present: per-channel permission overrides, role reordering, the audit log, webhooks, custom emoji and sticker management, AutoMod, server onboarding and events, account profile editing, and file options for slash commands.
 
 ### About voice
 

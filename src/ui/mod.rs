@@ -2,11 +2,13 @@
 
 mod call;
 mod chat;
+pub mod form;
 mod friends;
 mod login;
 mod members;
 mod rail;
 mod rich;
+mod server_settings;
 mod settings_view;
 mod sidebar;
 mod switcher;
@@ -36,6 +38,10 @@ pub struct AppView {
     settings: Option<Entity<settings_view::SettingsView>>,
     _settings_sub: Option<Subscription>,
     lightbox: Option<String>,
+    form: Option<Entity<form::FormDialog>>,
+    _form_sub: Option<Subscription>,
+    server_settings: Option<Entity<server_settings::ServerSettings>>,
+    _server_settings_sub: Option<Subscription>,
     _subs: Vec<Subscription>,
 }
 
@@ -115,8 +121,34 @@ impl AppView {
             settings: None,
             _settings_sub: None,
             lightbox: None,
+            form: None,
+            _form_sub: None,
+            server_settings: None,
+            _server_settings_sub: None,
             _subs: subs,
         }
+    }
+
+    pub fn show_form(&mut self, spec: form::FormSpec, window: &mut Window, cx: &mut Context<Self>) {
+        let dialog = cx.new(|cx| form::FormDialog::new(spec, window, cx));
+        self._form_sub = Some(cx.subscribe(&dialog, |this, _, _: &form::FormEvent, cx| {
+            this.form = None;
+            this._form_sub = None;
+            cx.notify();
+        }));
+        self.form = Some(dialog);
+        cx.notify();
+    }
+
+    pub fn show_server_settings(&mut self, guild: crate::discord::Id, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.new(|cx| server_settings::ServerSettings::new(self.store.clone(), guild, window, cx));
+        self._server_settings_sub = Some(cx.subscribe(&view, |this, _, _: &server_settings::ServerSettingsEvent, cx| {
+            this.server_settings = None;
+            this._server_settings_sub = None;
+            cx.notify();
+        }));
+        self.server_settings = Some(view);
+        cx.notify();
     }
 
     pub fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -233,7 +265,11 @@ impl Render for AppView {
             .size_full()
             // Full-window overlays close first on Escape.
             .capture_action(cx.listener(|this, _: &input::Escape, _, cx| {
-                if this.lightbox.take().is_some() || this.settings.take().is_some() {
+                if this.lightbox.take().is_some()
+                    || this.form.take().is_some()
+                    || this.server_settings.take().is_some()
+                    || this.settings.take().is_some()
+                {
                     this._settings_sub = None;
                     cx.notify();
                     cx.stop_propagation();
@@ -302,6 +338,10 @@ impl Render for AppView {
                     )
             }
         };
-        body.children(self.switcher.clone()).children(self.settings.clone()).children(lightbox)
+        body.children(self.switcher.clone())
+            .children(self.settings.clone())
+            .children(self.server_settings.clone())
+            .children(self.form.clone())
+            .children(lightbox)
     }
 }

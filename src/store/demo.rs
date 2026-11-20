@@ -27,7 +27,8 @@ impl Store {
             json!({
                 "id": id.to_string(),
                 "name": name,
-                "owner_id": "2",
+                // You own the first server, so the admin tools can be tried out.
+                "owner_id": if id == 100 { "1" } else { "2" },
                 "roles": [
                     { "id": id.to_string(), "name": "@everyone", "permissions": everyone_view, "position": 0 },
                     { "id": (id + 1).to_string(), "name": "Maintainers", "color": 0x34b3a0, "position": 2, "hoist": true, "permissions": maintainer },

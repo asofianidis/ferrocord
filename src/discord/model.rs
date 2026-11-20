@@ -150,6 +150,9 @@ pub struct Member {
     pub roles: Vec<Id>,
     #[serde(default)]
     pub avatar: Option<String>,
+    /// While set and in the future, the member is timed out.
+    #[serde(default)]
+    pub communication_disabled_until: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -165,6 +168,8 @@ pub struct Role {
     pub permissions: u64,
     #[serde(default, deserialize_with = "de_null")]
     pub hoist: bool,
+    #[serde(default, deserialize_with = "de_null")]
+    pub mentionable: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -389,6 +394,14 @@ pub struct VoiceState {
     pub request_to_speak_timestamp: Option<String>,
     #[serde(default)]
     pub member: Option<Member>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Ban {
+    #[serde(default)]
+    pub user: User,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

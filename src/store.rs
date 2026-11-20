@@ -5,8 +5,8 @@
 //! fine-grained [`StoreEvent`]s so that only the affected view re-renders.
 
 use crate::discord::{
-    self, Channel, Emoji, Gif, Guild, Id, Member, Message, Reaction, Status, StickerItem, User, VoiceState,
-    channel_kind,
+    self, Ban, Channel, Emoji, Gif, Guild, Id, Member, Message, Reaction, Role, Status, StickerItem, User,
+    VoiceState, channel_kind,
     commands::{self, SlashCommand},
     gateway::{self, Command, Event},
     proto::Folder,
@@ -884,6 +884,340 @@ impl Store {
             if let Err(e) = result {
                 log::warn!("could not sync mute setting: {e}");
             }
+        });
+    }
+
+    // ---------------------------------------------------------------- administration
+
+    /// Our permissions across a whole server.
+    pub fn guild_permissions(&self, guild: Id) -> u64 {
+        let Some(state) = self.guild(guild) else { return 0 };
+        permissions::base(&state.guild, self.my_id(), &state.own_roles)
+    }
+
+    pub fn can(&self, guild: Id, permission: u64) -> bool {
+        self.guild_permissions(guild) & permission == permission
+    }
+
+    /// The position of our highest role; roles at or above it cannot be managed.
+    pub fn top_role_position(&self, guild: Id) -> i32 {
+        let Some(state) = self.guild(guild) else { return 0 };
+        if state.guild.owner_id == Some(self.my_id()) {
+            return i32::MAX;
+        }
+        state.guild.roles.iter().filter(|r| state.own_roles.contains(&r.id)).map(|r| r.position).max().unwrap_or(0)
+    }
+
+    /// Runs an administrative request and applies its result locally, so the
+    /// change shows immediately (the gateway may confirm it again later).
+    fn admin<T: Send + 'static, F>(
+        &mut self,
+        what: &'static str,
+        cx: &mut Context<Self>,
+        call: impl FnOnce(Rest) -> F + Send + 'static,
+        apply: impl FnOnce(&mut Self, T, &mut Context<Self>) + 'static,
+    ) where
+        F: Future<Output = Result<T>> + Send + 'static,
+    {
+        let Some(rest) = self.rest.clone() else { return };
+        self.run(cx, async move { call(rest).await }, move |store, result, cx| {
+            if let Some(value) = store.report(result, what, cx) {
+                apply(store, value, cx);
+            }
+        });
+    }
+
+    pub fn rename_guild(&mut self, guild: Id, name: String, cx: &mut Context<Self>) {
+        let new_name = name.clone();
+        let apply = move |store: &mut Self, _: (), cx: &mut Context<Self>| {
+            if let Some(state) = store.guild_mut(guild) {
+                state.guild.name = new_name;
+            }
+            cx.emit(StoreEvent::Guilds);
+            cx.emit(StoreEvent::Channels);
+        };
+        if self.demo {
+            return apply(self, (), cx);
+        }
+        let body = serde_json::json!({ "name": name });
+        self.admin("Could not rename the server", cx, move |rest| async move { rest.modify_guild(guild, body).await }, apply);
+    }
+
+    /// Sets the server icon from image bytes, or removes it with `None`.
+    pub fn set_guild_icon(&mut self, guild: Id, image: Option<(String, Vec<u8>)>, cx: &mut Context<Self>) {
+        if self.demo {
+            cx.emit(StoreEvent::Notice("Icons are not uploaded in demo mode.".into()));
+            return;
+        }
+        let icon = image.map(|(mime, bytes)| data_uri(&mime, &bytes));
+        let body = serde_json::json!({ "icon": icon });
+        self.admin("Could not change the icon", cx, move |rest| async move { rest.modify_guild(guild, body).await }, |_, _, cx| {
+            cx.emit(StoreEvent::Notice("Server icon updated.".into()));
+        });
+    }
+
+    pub fn create_channel(&mut self, guild: Id, name: String, kind: u8, parent: Option<Id>, cx: &mut Context<Self>) {
+        let apply = move |store: &mut Self, mut channel: Channel, cx: &mut Context<Self>| {
+            channel.guild_id = Some(guild);
+            let id = channel.id;
+            let selectable = channel.is_text_like() || channel.is_forum();
+            store.upsert_channel(channel, cx);
+            if selectable {
+                store.messages.entry(id).or_insert_with(|| ChannelMessages {
+                    loaded: store.demo,
+                    reached_start: store.demo,
+                    ..Default::default()
+                });
+                store.select_channel(id, cx);
+            }
+        };
+        if self.demo {
+            let position = self.channels.values().filter(|c| c.guild_id == Some(guild)).map(|c| c.position).max();
+            let channel = Channel {
+                id: Id::now(),
+                kind,
+                guild_id: Some(guild),
+                name: Some(name),
+                parent_id: parent,
+                position: position.unwrap_or(0) + 1,
+                ..Default::default()
+            };
+            return apply(self, channel, cx);
+        }
+        let mut body = serde_json::json!({ "name": name, "type": kind });
+        if let Some(parent) = parent {
+            body["parent_id"] = parent.to_string().into();
+        }
+        self.admin("Could not create the channel", cx, move |rest| async move { rest.create_channel(guild, body).await }, apply);
+    }
+
+    pub fn edit_channel(&mut self, channel: Id, name: String, topic: Option<String>, cx: &mut Context<Self>) {
+        let apply = |store: &mut Self, updated: Channel, cx: &mut Context<Self>| store.upsert_channel(updated, cx);
+        if self.demo {
+            let Some(mut updated) = self.channels.get(&channel).cloned() else { return };
+            updated.name = Some(name);
+            if topic.is_some() {
+                updated.topic = topic;
+            }
+            return apply(self, updated, cx);
+        }
+        let mut body = serde_json::json!({ "name": name });
+        if let Some(topic) = topic {
+            body["topic"] = topic.into();
+        }
+        self.admin("Could not save the channel", cx, move |rest| async move { rest.modify_channel(channel, body).await }, apply);
+    }
+
+    pub fn delete_channel(&mut self, channel: Id, cx: &mut Context<Self>) {
+        let apply = move |store: &mut Self, _: (), cx: &mut Context<Self>| store.apply(Event::ChannelDelete(channel), cx);
+        if self.demo {
+            return apply(self, (), cx);
+        }
+        self.admin("Could not delete the channel", cx, move |rest| async move { rest.delete_channel(channel).await }, apply);
+    }
+
+    fn upsert_role(&mut self, guild: Id, role: Role, cx: &mut Context<Self>) {
+        if let Some(state) = self.guild_mut(guild) {
+            match state.guild.roles.iter_mut().find(|r| r.id == role.id) {
+                Some(existing) => *existing = role,
+                None => state.guild.roles.push(role),
+            }
+        }
+        self.recolor_members(guild);
+        self.rebuild_rows(guild);
+        cx.emit(StoreEvent::Guilds);
+        cx.emit(StoreEvent::Channels);
+        cx.emit(StoreEvent::Members(guild));
+    }
+
+    /// Recomputes everyone's name colour after a role change.
+    fn recolor_members(&mut self, guild: Id) {
+        let Some(state) = self.guild(guild) else { return };
+        let roles = state.guild.roles.clone();
+        let color_of = |member_roles: &[Id]| {
+            roles
+                .iter()
+                .filter(|r| r.color != 0 && member_roles.contains(&r.id))
+                .max_by_key(|r| r.position)
+                .map(|r| r.color)
+        };
+        for ((g, _), info) in self.member_info.iter_mut() {
+            if *g == guild {
+                info.color = color_of(&info.roles);
+            }
+        }
+        let infos = &self.member_info;
+        if let Some(rows) = self.member_lists.get_mut(&guild) {
+            for row in rows.iter_mut() {
+                if let MemberRow::Member { user, color, nick, .. } = row {
+                    if let Some(info) = infos.get(&(guild, user.id)) {
+                        *color = info.color;
+                        *nick = info.nick.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Creates a role and hands its id to `then` (to open it for editing).
+    pub fn create_role(&mut self, guild: Id, cx: &mut Context<Self>, then: impl FnOnce(Id, &mut gpui::App) + 'static) {
+        let apply = move |store: &mut Self, role: Role, cx: &mut Context<Self>| {
+            let id = role.id;
+            store.upsert_role(guild, role, cx);
+            cx.defer(move |cx| then(id, cx));
+        };
+        if self.demo {
+            let role = Role { id: Id::now(), name: "new role".into(), position: 1, ..Default::default() };
+            return apply(self, role, cx);
+        }
+        let body = serde_json::json!({ "name": "new role" });
+        self.admin("Could not create the role", cx, move |rest| async move { rest.create_role(guild, body).await }, apply);
+    }
+
+    pub fn save_role(&mut self, guild: Id, role: Id, name: String, color: u32, permissions: u64, hoist: bool, cx: &mut Context<Self>) {
+        let apply = move |store: &mut Self, updated: Role, cx: &mut Context<Self>| {
+            store.upsert_role(guild, updated, cx);
+            cx.emit(StoreEvent::Notice("Role saved.".into()));
+        };
+        if self.demo {
+            let Some(mut updated) = self.guild(guild).and_then(|g| g.guild.roles.iter().find(|r| r.id == role)).cloned()
+            else {
+                return;
+            };
+            updated.name = name;
+            updated.color = color;
+            updated.permissions = permissions;
+            updated.hoist = hoist;
+            return apply(self, updated, cx);
+        }
+        let body = serde_json::json!({
+            "name": name, "color": color, "permissions": permissions.to_string(), "hoist": hoist,
+        });
+        self.admin("Could not save the role", cx, move |rest| async move { rest.modify_role(guild, role, body).await }, apply);
+    }
+
+    pub fn delete_role(&mut self, guild: Id, role: Id, cx: &mut Context<Self>) {
+        let apply = move |store: &mut Self, _: (), cx: &mut Context<Self>| store.apply(Event::RoleDelete { guild_id: guild, role_id: role }, cx);
+        if self.demo {
+            return apply(self, (), cx);
+        }
+        self.admin("Could not delete the role", cx, move |rest| async move { rest.delete_role(guild, role).await }, apply);
+    }
+
+    pub fn member_roles(&self, guild: Id, user: Id) -> Vec<Id> {
+        if user == self.my_id() {
+            return self.guild(guild).map(|g| g.own_roles.clone()).unwrap_or_default();
+        }
+        self.member_info.get(&(guild, user)).map(|m| m.roles.clone()).unwrap_or_default()
+    }
+
+    fn update_member_locally(&mut self, guild: Id, user: Id, cx: &mut Context<Self>, change: impl FnOnce(&mut MemberInfo)) {
+        let info = self.member_info.entry((guild, user)).or_default();
+        change(info);
+        let roles = info.roles.clone();
+        if user == self.my_id() {
+            if let Some(state) = self.guild_mut(guild) {
+                state.own_roles = roles;
+            }
+            self.rebuild_rows(guild);
+        }
+        self.recolor_members(guild);
+        cx.emit(StoreEvent::Members(guild));
+        cx.emit(StoreEvent::Channels);
+    }
+
+    pub fn set_member_role(&mut self, guild: Id, user: Id, role: Id, on: bool, cx: &mut Context<Self>) {
+        let apply = move |store: &mut Self, _: (), cx: &mut Context<Self>| {
+            let current = store.member_roles(guild, user);
+            store.update_member_locally(guild, user, cx, |info| {
+                info.roles = current;
+                info.roles.retain(|r| *r != role);
+                if on {
+                    info.roles.push(role);
+                }
+            });
+        };
+        if self.demo {
+            return apply(self, (), cx);
+        }
+        self.admin("Could not change roles", cx, move |rest| async move { rest.set_member_role(guild, user, role, on).await }, apply);
+    }
+
+    pub fn set_nickname(&mut self, guild: Id, user: Id, nick: Option<String>, cx: &mut Context<Self>) {
+        let me = self.my_id();
+        let nick_for_apply = nick.clone();
+        let apply = move |store: &mut Self, _: (), cx: &mut Context<Self>| {
+            store.update_member_locally(guild, user, cx, |info| info.nick = nick_for_apply);
+        };
+        if self.demo {
+            return apply(self, (), cx);
+        }
+        let target = (user != me).then_some(user);
+        self.admin("Could not change the nickname", cx, move |rest| async move {
+            rest.set_nickname(guild, target, nick.as_deref()).await
+        }, apply);
+    }
+
+    /// Times a member out for `minutes`, or lifts a timeout with `None`.
+    pub fn timeout_member(&mut self, guild: Id, user: Id, minutes: Option<i64>, cx: &mut Context<Self>) {
+        let until = minutes.map(|m| (chrono::Utc::now() + chrono::Duration::minutes(m)).to_rfc3339());
+        let notice = match minutes {
+            Some(m) if m >= 1440 => format!("Timed out for {} day(s).", m / 1440),
+            Some(m) => format!("Timed out for {} hour(s).", (m / 60).max(1)),
+            None => "Timeout removed.".to_string(),
+        };
+        if self.demo {
+            cx.emit(StoreEvent::Notice(notice));
+            return;
+        }
+        let body = serde_json::json!({ "communication_disabled_until": until });
+        self.admin("Could not time out the member", cx, move |rest| async move { rest.modify_member(guild, user, body).await }, move |_, _, cx| {
+            cx.emit(StoreEvent::Notice(notice));
+        });
+    }
+
+    pub fn kick_member(&mut self, guild: Id, user: Id, cx: &mut Context<Self>) {
+        let apply = move |store: &mut Self, _: (), cx: &mut Context<Self>| {
+            store.apply(Event::MemberRemove { guild_id: guild, user_id: user }, cx);
+            cx.emit(StoreEvent::Notice("Member kicked.".into()));
+        };
+        if self.demo {
+            return apply(self, (), cx);
+        }
+        self.admin("Could not kick the member", cx, move |rest| async move { rest.kick(guild, user).await }, apply);
+    }
+
+    pub fn ban_member(&mut self, guild: Id, user: Id, delete_message_seconds: u32, cx: &mut Context<Self>) {
+        let apply = move |store: &mut Self, _: (), cx: &mut Context<Self>| {
+            store.apply(Event::MemberRemove { guild_id: guild, user_id: user }, cx);
+            cx.emit(StoreEvent::Notice("Member banned.".into()));
+        };
+        if self.demo {
+            return apply(self, (), cx);
+        }
+        self.admin("Could not ban the member", cx, move |rest| async move {
+            rest.ban(guild, user, delete_message_seconds).await
+        }, apply);
+    }
+
+    pub fn fetch_bans(&mut self, guild: Id, cx: &mut Context<Self>, then: impl FnOnce(Vec<Ban>, &mut gpui::App) + 'static) {
+        if self.demo {
+            let sample = vec![Ban { user: User { id: Id(77), username: "spammer".into(), ..Default::default() }, reason: Some("Spam".into()) }];
+            cx.defer(move |cx| then(sample, cx));
+            return;
+        }
+        self.admin("Could not load bans", cx, move |rest| async move { rest.bans(guild).await }, move |_, bans, cx| {
+            cx.defer(move |cx| then(bans, cx));
+        });
+    }
+
+    pub fn unban(&mut self, guild: Id, user: Id, cx: &mut Context<Self>, then: impl FnOnce(&mut gpui::App) + 'static) {
+        if self.demo {
+            cx.defer(then);
+            return;
+        }
+        self.admin("Could not unban", cx, move |rest| async move { rest.unban(guild, user).await }, move |_, _, cx| {
+            cx.defer(then);
         });
     }
 
@@ -2386,6 +2720,38 @@ impl Store {
                     }
                 });
             }
+            Event::RoleUpsert { guild_id, role } => self.upsert_role(guild_id, role, cx),
+            Event::RoleDelete { guild_id, role_id } => {
+                if let Some(state) = self.guild_mut(guild_id) {
+                    state.guild.roles.retain(|r| r.id != role_id);
+                    state.own_roles.retain(|r| *r != role_id);
+                }
+                for ((g, _), info) in self.member_info.iter_mut() {
+                    if *g == guild_id {
+                        info.roles.retain(|r| *r != role_id);
+                    }
+                }
+                self.recolor_members(guild_id);
+                self.rebuild_rows(guild_id);
+                cx.emit(StoreEvent::Guilds);
+                cx.emit(StoreEvent::Channels);
+                cx.emit(StoreEvent::Members(guild_id));
+            }
+            Event::MemberUpdate { guild_id, member } => {
+                if let Some(user) = member.user.clone() {
+                    self.learn_member(guild_id, &user, &member);
+                    self.users.insert(user.id, user);
+                }
+                self.recolor_members(guild_id);
+                cx.emit(StoreEvent::Members(guild_id));
+            }
+            Event::MemberRemove { guild_id, user_id } => {
+                if let Some(rows) = self.member_lists.get_mut(&guild_id) {
+                    rows.retain(|row| !matches!(row, MemberRow::Member { user, .. } if user.id == user_id));
+                }
+                self.member_info.remove(&(guild_id, user_id));
+                cx.emit(StoreEvent::Members(guild_id));
+            }
             Event::Presence { user_id, status } => {
                 self.presences.insert(user_id, status);
             }
@@ -2586,6 +2952,23 @@ impl Store {
         }
         self.member_lists.insert(guild_id, rows);
         cx.emit(StoreEvent::Members(guild_id));
+    }
+}
+
+/// Encodes image bytes as the data URI Discord expects for icons and avatars.
+pub fn data_uri(mime: &str, bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+/// Guesses an image's type from its first bytes.
+pub fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
+        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
+        [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("image/webp"),
+        _ => None,
     }
 }
 

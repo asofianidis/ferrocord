@@ -1,6 +1,6 @@
 //! Minimal Discord REST client with rate-limit handling.
 
-use super::model::{Channel, Gif, Id, Message};
+use super::model::{Ban, Channel, Gif, Id, Message, Role};
 use anyhow::{Result, anyhow};
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde_json::{Value, json};
@@ -381,6 +381,86 @@ impl Rest {
         let path = format!("/guilds/{guild}/members/{user}");
         self.send(|| self.request(Method::PATCH, &path).json(&body)).await?;
         Ok(())
+    }
+
+    // ------------------------------------------------------------ administration
+
+    pub async fn modify_guild(&self, guild: Id, body: Value) -> Result<()> {
+        let path = format!("/guilds/{guild}");
+        self.send(|| self.request(Method::PATCH, &path).json(&body)).await?;
+        Ok(())
+    }
+
+    pub async fn create_channel(&self, guild: Id, body: Value) -> Result<Channel> {
+        let path = format!("/guilds/{guild}/channels");
+        Ok(self.send(|| self.request(Method::POST, &path).json(&body)).await?.json().await?)
+    }
+
+    pub async fn modify_channel(&self, channel: Id, body: Value) -> Result<Channel> {
+        let path = format!("/channels/{channel}");
+        Ok(self.send(|| self.request(Method::PATCH, &path).json(&body)).await?.json().await?)
+    }
+
+    pub async fn delete_channel(&self, channel: Id) -> Result<()> {
+        let path = format!("/channels/{channel}");
+        self.send(|| self.request(Method::DELETE, &path)).await?;
+        Ok(())
+    }
+
+    pub async fn create_role(&self, guild: Id, body: Value) -> Result<Role> {
+        let path = format!("/guilds/{guild}/roles");
+        Ok(self.send(|| self.request(Method::POST, &path).json(&body)).await?.json().await?)
+    }
+
+    pub async fn modify_role(&self, guild: Id, role: Id, body: Value) -> Result<Role> {
+        let path = format!("/guilds/{guild}/roles/{role}");
+        Ok(self.send(|| self.request(Method::PATCH, &path).json(&body)).await?.json().await?)
+    }
+
+    pub async fn delete_role(&self, guild: Id, role: Id) -> Result<()> {
+        let path = format!("/guilds/{guild}/roles/{role}");
+        self.send(|| self.request(Method::DELETE, &path)).await?;
+        Ok(())
+    }
+
+    pub async fn set_member_role(&self, guild: Id, user: Id, role: Id, on: bool) -> Result<()> {
+        let path = format!("/guilds/{guild}/members/{user}/roles/{role}");
+        let method = if on { Method::PUT } else { Method::DELETE };
+        self.send(|| self.request(method.clone(), &path).body("")).await?;
+        Ok(())
+    }
+
+    /// Changes a nickname; `user` is `None` for our own.
+    pub async fn set_nickname(&self, guild: Id, user: Option<Id>, nick: Option<&str>) -> Result<()> {
+        let who = user.map_or_else(|| "@me".to_string(), |u| u.to_string());
+        let path = format!("/guilds/{guild}/members/{who}");
+        let body = json!({ "nick": nick });
+        self.send(|| self.request(Method::PATCH, &path).json(&body)).await?;
+        Ok(())
+    }
+
+    pub async fn kick(&self, guild: Id, user: Id) -> Result<()> {
+        let path = format!("/guilds/{guild}/members/{user}");
+        self.send(|| self.request(Method::DELETE, &path)).await?;
+        Ok(())
+    }
+
+    pub async fn ban(&self, guild: Id, user: Id, delete_message_seconds: u32) -> Result<()> {
+        let path = format!("/guilds/{guild}/bans/{user}");
+        let body = json!({ "delete_message_seconds": delete_message_seconds });
+        self.send(|| self.request(Method::PUT, &path).json(&body)).await?;
+        Ok(())
+    }
+
+    pub async fn unban(&self, guild: Id, user: Id) -> Result<()> {
+        let path = format!("/guilds/{guild}/bans/{user}");
+        self.send(|| self.request(Method::DELETE, &path)).await?;
+        Ok(())
+    }
+
+    pub async fn bans(&self, guild: Id) -> Result<Vec<Ban>> {
+        let path = format!("/guilds/{guild}/bans?limit=1000");
+        Ok(self.send(|| self.request(Method::GET, &path)).await?.json().await?)
     }
 
     pub async fn open_dm(&self, user: Id) -> Result<Channel> {

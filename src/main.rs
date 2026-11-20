@@ -53,6 +53,7 @@ fn main() {
                 gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| ui::AppView::new(store, window, cx)))
                     .expect("failed to open the main window");
 
+            cx.set_global(ui::form::AppHandle(view.downgrade()));
             let settings_view = view.clone();
             // Registered globally so the shortcuts work wherever focus is.
             cx.bind_keys([

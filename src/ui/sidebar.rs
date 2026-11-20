@@ -1,8 +1,13 @@
 //! Channel list (or direct-message list) and the current-user panel.
 
-use super::{call, theme, widgets::*};
+use super::{
+    call,
+    form::{self, Field, FormSpec},
+    theme,
+    widgets::*,
+};
 use crate::{
-    discord::{Id, channel_kind},
+    discord::{Id, channel_kind, permissions},
     store::{ChannelRow, RowKind, Store, StoreEvent},
 };
 use gpui::{prelude::*, *};
@@ -71,7 +76,9 @@ impl Sidebar {
             let name = channel.name.clone().unwrap_or_default();
             if row.kind == RowKind::Category {
                 let collapsed = store.collapsed.contains(&id);
-                out.push(
+                let category_admin =
+                    channel.guild_id.filter(|g| store.can(*g, permissions::MANAGE_CHANNELS));
+                let row =
                     h_flex()
                         .id(("category", id.0))
                         .w_full()
@@ -92,9 +99,21 @@ impl Sidebar {
                         .child(div().flex_1().min_w_0().truncate().child(name.to_uppercase()))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.store.update(cx, |store, cx| store.toggle_category(id, cx));
-                        }))
-                        .into_any_element(),
-                );
+                        }));
+                out.push(match category_admin {
+                    Some(guild) => {
+                        let store = self.store.clone();
+                        row.context_menu(move |menu, _, _| {
+                            let create = store.clone();
+                            let menu = menu.item(PopupMenuItem::new("Create Channel").on_click(move |_, window, cx| {
+                                form::open_form(create_channel_form(create.clone(), guild, Some(id)), window, cx);
+                            }));
+                            channel_admin_items(menu, store.clone(), id, true)
+                        })
+                        .into_any_element()
+                    }
+                    None => row.into_any_element(),
+                });
                 continue;
             }
             // A forum stays highlighted while one of its posts is open.
@@ -108,6 +127,7 @@ impl Sidebar {
             let is_thread = row.kind == RowKind::Thread;
             let muted = store.muted.contains(&id);
             let is_voice = channel.is_voice();
+            let can_manage = channel.guild_id.is_some_and(|g| store.can(g, permissions::MANAGE_CHANNELS));
             let color = if selected || unread { theme::text_bright() } else { theme::text_muted() };
             out.push(
                 div()
@@ -160,9 +180,9 @@ impl Sidebar {
                         let store = self.store.clone();
                         move |menu, _, _| {
                             let store = store.clone();
-                            let (mute, invite) = (store.clone(), store.clone());
-                            menu.item(PopupMenuItem::new("Mark as Read").on_click(move |_, _, cx| {
-                                store.update(cx, |store, cx| store.mark_read(id, cx));
+                            let (mute, invite, read) = (store.clone(), store.clone(), store.clone());
+                            let mut menu = menu.item(PopupMenuItem::new("Mark as Read").on_click(move |_, _, cx| {
+                                read.update(cx, |store, cx| store.mark_read(id, cx));
                             }))
                             .item(PopupMenuItem::new(if muted { "Unmute Channel" } else { "Mute Channel" }).on_click(
                                 move |_, _, cx| mute.update(cx, |store, cx| store.toggle_mute(id, cx)),
@@ -173,7 +193,11 @@ impl Sidebar {
                             .separator()
                             .item(PopupMenuItem::new("Copy Channel ID").on_click(move |_, _, cx| {
                                 cx.write_to_clipboard(ClipboardItem::new_string(id.to_string()));
-                            }))
+                            }));
+                            if can_manage {
+                                menu = channel_admin_items(menu, store, id, false);
+                            }
+                            menu
                         }
                     })
                     .into_any_element(),
@@ -357,6 +381,13 @@ impl Render for Sidebar {
 
         let me = store.me.clone();
         let my_status = store.my_status;
+        let header_guild = store.selected_guild.filter(|g| store.guild(*g).is_some());
+        let can_create = header_guild.is_some_and(|g| store.can(g, permissions::MANAGE_CHANNELS));
+        let can_settings = header_guild.is_some_and(|g| {
+            store.guild_permissions(g)
+                & (permissions::MANAGE_GUILD | permissions::MANAGE_ROLES | permissions::BAN_MEMBERS)
+                != 0
+        });
 
         v_flex()
             .w(px(248.))
@@ -372,7 +403,18 @@ impl Render for Sidebar {
                     .border_color(theme::border())
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::text_bright())
-                    .child(div().flex_1().min_w_0().truncate().child(title)),
+                    .child(div().flex_1().min_w_0().truncate().child(title))
+                    .when_some(header_guild.filter(|_| can_create), |d, guild| {
+                        let store = self.store.clone();
+                        d.child(icon_button("create-channel", IconName::Plus, "Create channel").on_click(
+                            move |_, window, cx| form::open_form(create_channel_form(store.clone(), guild, None), window, cx),
+                        ))
+                    })
+                    .when_some(header_guild.filter(|_| can_settings), |d, guild| {
+                        d.child(icon_button("server-settings", IconName::Settings, "Server settings").on_click(
+                            move |_, window, cx| form::open_server_settings(guild, window, cx),
+                        ))
+                    }),
             )
             .child(list)
             .children(voice_panel)
@@ -433,4 +475,66 @@ impl Render for Sidebar {
                 )
             })
     }
+}
+
+const CHANNEL_TYPES: [(&str, u8); 6] = [
+    ("Text", channel_kind::TEXT),
+    ("Voice", channel_kind::VOICE),
+    ("Forum", channel_kind::FORUM),
+    ("Stage", channel_kind::STAGE),
+    ("Announcement", channel_kind::ANNOUNCEMENT),
+    ("Category", channel_kind::CATEGORY),
+];
+
+fn create_channel_form(store: Entity<Store>, guild: Id, parent: Option<Id>) -> FormSpec {
+    let labels: Vec<&str> = CHANNEL_TYPES.iter().map(|(label, _)| *label).collect();
+    FormSpec::new("Create Channel", "Create", move |result, _, cx| {
+        let name = result.values[0].clone();
+        if name.is_empty() {
+            return;
+        }
+        let kind = CHANNEL_TYPES[result.choice].1;
+        // Categories cannot sit inside other categories.
+        let parent = if kind == channel_kind::CATEGORY { None } else { parent };
+        store.update(cx, |s, cx| s.create_channel(guild, name, kind, parent, cx));
+    })
+    .field(Field { label: "Name".into(), value: String::new(), placeholder: "new-channel".into() })
+    .choice("Type", &labels, 0)
+}
+
+/// Edit and delete entries for a channel or category menu.
+fn channel_admin_items(
+    menu: gpui_component::menu::PopupMenu,
+    store: Entity<Store>,
+    id: Id,
+    is_category: bool,
+) -> gpui_component::menu::PopupMenu {
+    let (edit, delete) = (store.clone(), store);
+    let noun = if is_category { "Category" } else { "Channel" };
+    menu.separator()
+        .item(PopupMenuItem::new(format!("Edit {noun}")).on_click(move |_, window, cx| {
+            let Some(channel) = edit.read(cx).channels.get(&id).cloned() else { return };
+            let has_topic = channel.is_text_like() && !channel.is_voice() && !is_category;
+            let store = edit.clone();
+            let mut spec = FormSpec::new(format!("Edit {noun}"), "Save", move |result, _, cx| {
+                let name = result.values[0].clone();
+                if name.is_empty() {
+                    return;
+                }
+                let topic = result.values.get(1).cloned();
+                store.update(cx, |s, cx| s.edit_channel(id, name, topic, cx));
+            })
+            .field(Field::new("Name", channel.name.clone().unwrap_or_default()));
+            if has_topic {
+                spec = spec.field(Field::new("Topic", channel.topic.clone().unwrap_or_default()));
+            }
+            form::open_form(spec, window, cx);
+        }))
+        .item(PopupMenuItem::new(format!("Delete {noun}")).on_click(move |_, window, cx| {
+            let name = delete.read(cx).channels.get(&id).and_then(|c| c.name.clone()).unwrap_or_default();
+            let store = delete.clone();
+            form::confirm(window, cx, &format!("Delete {name}?"), "This cannot be undone.", "Delete", move |cx| {
+                store.update(cx, |s, cx| s.delete_channel(id, cx));
+            });
+        }))
 }

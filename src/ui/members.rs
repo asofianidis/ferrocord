@@ -1,7 +1,15 @@
 //! The member list on the right-hand side of guild channels.
 
-use super::{theme, widgets::*};
-use crate::store::{MemberRow, Store, StoreEvent};
+use super::{
+    form::{self, Field, FormSpec},
+    theme,
+    widgets::*,
+};
+use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
+use crate::{
+    discord::{Id, permissions},
+    store::{MemberRow, Store, StoreEvent},
+};
 use gpui::{prelude::*, *};
 use std::ops::Range;
 
@@ -22,7 +30,8 @@ impl Members {
 
     fn rows(&mut self, range: Range<usize>, _: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let store = self.store.read(cx);
-        let Some(list) = store.selected_guild.and_then(|g| store.member_lists.get(&g)) else {
+        let Some(guild) = store.selected_guild else { return Vec::new() };
+        let Some(list) = store.member_lists.get(&guild) else {
             return Vec::new();
         };
         let mut out = Vec::with_capacity(range.len());
@@ -73,7 +82,7 @@ impl Members {
                                         .min_w_0()
                                         .truncate()
                                         .text_color(color.map(theme::c).unwrap_or_else(theme::text))
-                                        .child(name),
+                                        .child(name.clone()),
                                 )
                                 .when(user.bot, |d| d.child(bot_tag())),
                         )
@@ -81,6 +90,11 @@ impl Members {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.store.update(cx, |store, cx| store.open_dm(user_id, cx));
                         }))
+                        .context_menu({
+                            let store = self.store.clone();
+                            let display = name.clone();
+                            move |menu, _, cx| member_menu(menu, store.clone(), guild, user_id, display.clone(), cx)
+                        })
                         .into_any_element()
                 }
             });
@@ -117,4 +131,105 @@ impl Render for Members {
             uniform_list(("members", key), count, cx.processor(Self::rows)).flex_1().into_any_element()
         })
     }
+}
+
+/// The right-click menu for a member: nickname, roles and moderation, as
+/// far as our permissions allow.
+fn member_menu(
+    menu: gpui_component::menu::PopupMenu,
+    store: Entity<Store>,
+    guild: Id,
+    user: Id,
+    name: String,
+    cx: &App,
+) -> gpui_component::menu::PopupMenu {
+    let s = store.read(cx);
+    let me = s.my_id();
+    let perms = s.guild_permissions(guild);
+    let has = |bit: u64| perms & bit == bit;
+    let is_me = user == me;
+    let is_owner = s.guild(guild).and_then(|g| g.guild.owner_id) == Some(user);
+    let top = s.top_role_position(guild);
+    let current_roles = s.member_roles(guild, user);
+    let current_nick = s.member_info.get(&(guild, user)).and_then(|m| m.nick.clone()).unwrap_or_default();
+    let mut assignable: Vec<_> = s
+        .guild(guild)
+        .map(|g| g.guild.roles.iter().filter(|r| r.id != guild && r.position < top).cloned().collect())
+        .unwrap_or_default();
+    assignable.sort_by_key(|r| std::cmp::Reverse(r.position));
+
+    let mut menu = menu;
+    let mut any = false;
+    if (is_me && has(1 << 26)) || has(permissions::MANAGE_NICKNAMES) {
+        any = true;
+        let store = store.clone();
+        menu = menu.item(PopupMenuItem::new("Change Nickname").on_click(move |_, window, cx| {
+            let store = store.clone();
+            let spec = FormSpec::new("Change Nickname", "Save", move |result, _, cx| {
+                let nick = Some(result.values[0].clone()).filter(|n| !n.is_empty());
+                store.update(cx, |s, cx| s.set_nickname(guild, user, nick, cx));
+            })
+            .description("Leave it empty to reset.")
+            .field(Field::new("Nickname", current_nick.clone()));
+            form::open_form(spec, window, cx);
+        }));
+    }
+    if has(permissions::MANAGE_ROLES) && !assignable.is_empty() {
+        any = true;
+        menu = menu.separator().label("Roles");
+        for role in assignable {
+            let on = current_roles.contains(&role.id);
+            let store = store.clone();
+            menu = menu.item(PopupMenuItem::new(role.name.clone()).checked(on).on_click(move |_, _, cx| {
+                store.update(cx, |s, cx| s.set_member_role(guild, user, role.id, !on, cx));
+            }));
+        }
+    }
+    if !is_me && !is_owner {
+        if has(permissions::MODERATE_MEMBERS) {
+            any = true;
+            menu = menu.separator();
+            for (label, minutes) in
+                [("Timeout for 1 Hour", Some(60)), ("Timeout for 1 Day", Some(1440)), ("Timeout for 1 Week", Some(10080)), ("Remove Timeout", None)]
+            {
+                let store = store.clone();
+                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                    store.update(cx, |s, cx| s.timeout_member(guild, user, minutes, cx));
+                }));
+            }
+        }
+        if has(permissions::KICK_MEMBERS) || has(permissions::BAN_MEMBERS) {
+            any = true;
+            menu = menu.separator();
+        }
+        if has(permissions::KICK_MEMBERS) {
+            let (store, name) = (store.clone(), name.clone());
+            menu = menu.item(PopupMenuItem::new(format!("Kick {name}")).on_click(move |_, window, cx| {
+                let store = store.clone();
+                form::confirm(window, cx, &format!("Kick {name}?"), "They can rejoin with a new invite.", "Kick", move |cx| {
+                    store.update(cx, |s, cx| s.kick_member(guild, user, cx));
+                });
+            }));
+        }
+        if has(permissions::BAN_MEMBERS) {
+            let (store, name) = (store.clone(), name.clone());
+            menu = menu.item(PopupMenuItem::new(format!("Ban {name}")).on_click(move |_, window, cx| {
+                let store = store.clone();
+                form::confirm(
+                    window,
+                    cx,
+                    &format!("Ban {name}?"),
+                    "Their messages from the last day are deleted too.",
+                    "Ban",
+                    move |cx| store.update(cx, |s, cx| s.ban_member(guild, user, 86_400, cx)),
+                );
+            }));
+        }
+    }
+    if !any {
+        menu = menu.label("No actions available");
+    }
+    menu.separator().item(PopupMenuItem::new("Copy User ID").on_click(move |_, _, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string(user.to_string()));
+    }))
 }

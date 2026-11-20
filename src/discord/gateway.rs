@@ -82,6 +82,11 @@ pub enum Event {
     /// `kind` is `None` when the relationship was removed.
     Relationship { id: Id, user: Option<User>, kind: Option<u8> },
     Mutes(Vec<(Id, bool)>),
+    RoleUpsert { guild_id: Id, role: Role },
+    RoleDelete { guild_id: Id, role_id: Id },
+    /// Someone's nickname, roles or timeout changed.
+    MemberUpdate { guild_id: Id, member: Member },
+    MemberRemove { guild_id: Id, user_id: Id },
 }
 
 #[derive(Debug)]
@@ -543,13 +548,29 @@ fn dispatch(state: &mut State, kind: &str, mut d: Value) -> Vec<Event> {
             vec![Event::MembersChunk { guild_id, members, presences }]
         }
         "GUILD_MEMBER_UPDATE" => {
-            if id_of(&d["user"]["id"]) != Some(state.user_id) {
-                return vec![];
-            }
             let Some(guild_id) = id_of(&d["guild_id"]) else { return vec![] };
-            let roles = d["roles"].as_array().map(|a| a.iter().filter_map(id_of).collect()).unwrap_or_default();
-            vec![Event::OwnMemberUpdate { guild_id, roles }]
+            let mut out = Vec::new();
+            if id_of(&d["user"]["id"]) == Some(state.user_id) {
+                let roles = d["roles"].as_array().map(|a| a.iter().filter_map(id_of).collect()).unwrap_or_default();
+                out.push(Event::OwnMemberUpdate { guild_id, roles });
+            }
+            if let Some(member) = parse::<Member>(d, kind) {
+                out.push(Event::MemberUpdate { guild_id, member });
+            }
+            out
         }
+        "GUILD_MEMBER_REMOVE" => match (id_of(&d["guild_id"]), id_of(&d["user"]["id"])) {
+            (Some(guild_id), Some(user_id)) => vec![Event::MemberRemove { guild_id, user_id }],
+            _ => vec![],
+        },
+        "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE" => {
+            let Some(guild_id) = id_of(&d["guild_id"]) else { return vec![] };
+            one(parse::<Role>(d["role"].take(), kind).map(|role| Event::RoleUpsert { guild_id, role }))
+        }
+        "GUILD_ROLE_DELETE" => match (id_of(&d["guild_id"]), id_of(&d["role_id"])) {
+            (Some(guild_id), Some(role_id)) => vec![Event::RoleDelete { guild_id, role_id }],
+            _ => vec![],
+        },
         _ => vec![],
     }
 }
