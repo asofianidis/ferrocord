@@ -10,11 +10,23 @@ pub struct Field {
     pub label: String,
     pub value: String,
     pub placeholder: String,
+    /// Mask the text, for passwords.
+    pub secret: bool,
 }
 
 impl Field {
     pub fn new(label: impl Into<String>, value: impl Into<String>) -> Self {
-        Self { label: label.into(), value: value.into(), placeholder: String::new() }
+        Self { label: label.into(), value: value.into(), placeholder: String::new(), secret: false }
+    }
+
+    pub fn placeholder(mut self, text: impl Into<String>) -> Self {
+        self.placeholder = text.into();
+        self
+    }
+
+    pub fn secret(mut self) -> Self {
+        self.secret = true;
+        self
     }
 }
 
@@ -102,8 +114,9 @@ impl FormDialog {
             .map(|field| {
                 let placeholder = field.placeholder.clone();
                 let value = field.value.clone();
+                let secret = field.secret;
                 let state = cx.new(|cx| {
-                    let mut s = InputState::new(window, cx).placeholder(placeholder);
+                    let mut s = InputState::new(window, cx).placeholder(placeholder).masked(secret);
                     s.set_value(value, window, cx);
                     s
                 });

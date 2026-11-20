@@ -30,7 +30,7 @@ The official client is an Electron app: high memory use, slow startup, and a slu
 - Forum channels list their posts, with a form to create one
 
 **Apps**
-- Slash commands with named or positional arguments, including subcommands
+- Slash commands with named or positional arguments, including subcommands; attached files fill a command's file options
 - Buttons and select menus on app messages
 
 **People**
@@ -48,6 +48,7 @@ The official client is an Electron app: high memory use, slow startup, and a slu
 - Members: change nicknames, add and remove roles, time out, kick and ban, limited to what your permissions allow
 
 **App**
+- Account: display name, username, avatar, pronouns and about-me text
 - Themes, including your own
 - Leave a server, close a conversation, copy an invite link
 - Automatic reconnect and session resume
@@ -58,7 +59,7 @@ Discord only offers some features to user accounts: search, friends, GIF search,
 
 ### Not implemented
 
-Video, camera and screen sharing. Voice is built on songbird, which handles audio only, so video would need its own transport, codecs and DAVE frame encryption. Also not present: per-channel permission overrides, role reordering, the audit log, webhooks, custom emoji and sticker management, AutoMod, server onboarding and events, account profile editing, and file options for slash commands.
+Video, camera and screen sharing. Voice is built on songbird, which handles audio only, so video would need its own transport, codecs and DAVE frame encryption. Also not present: per-channel permission overrides, role reordering, the audit log, webhooks, custom emoji and sticker management, AutoMod, and server onboarding and events.
 
 ### About voice
 

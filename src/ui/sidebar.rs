@@ -498,7 +498,7 @@ fn create_channel_form(store: Entity<Store>, guild: Id, parent: Option<Id>) -> F
         let parent = if kind == channel_kind::CATEGORY { None } else { parent };
         store.update(cx, |s, cx| s.create_channel(guild, name, kind, parent, cx));
     })
-    .field(Field { label: "Name".into(), value: String::new(), placeholder: "new-channel".into() })
+    .field(Field::new("Name", "").placeholder("new-channel"))
     .choice("Type", &labels, 0)
 }
 

@@ -27,6 +27,8 @@ pub struct SlashCommand {
 
 const SUBCOMMAND: u64 = 1;
 const SUBCOMMAND_GROUP: u64 = 2;
+/// Options of this type take a file rather than text.
+pub const ATTACHMENT: u8 = 11;
 
 impl SlashCommand {
     /// What the user types, without the leading slash: `"poll create"`.
@@ -42,9 +44,17 @@ impl SlashCommand {
     pub fn usage(&self) -> String {
         self.options
             .iter()
-            .map(|o| if o.required { format!("{}:", o.name) } else { format!("[{}:]", o.name) })
+            .map(|o| {
+                let shown = if o.kind == ATTACHMENT { format!("{}: <file>", o.name) } else { format!("{}:", o.name) };
+                if o.required { shown } else { format!("[{shown}]") }
+            })
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    /// How many files the command can take.
+    pub fn file_options(&self) -> usize {
+        self.options.iter().filter(|o| o.kind == ATTACHMENT).count()
     }
 }
 
@@ -140,7 +150,6 @@ fn convert(option: &CommandOption, text: &str) -> Result<Value, String> {
             }
             json!(digits)
         }
-        11 => return Err(format!("`{}` takes a file, which is not supported here.", option.name)),
         _ => json!(text),
     })
 }
@@ -148,14 +157,17 @@ fn convert(option: &CommandOption, text: &str) -> Result<Value, String> {
 /// Splits typed arguments into option values.
 ///
 /// Arguments may be named (`city: Paris days: 3`) or positional, in which
-/// case the last option takes whatever text remains.
-pub fn parse_args(options: &[CommandOption], text: &str) -> Result<Vec<Value>, String> {
+/// case the last option takes whatever text remains. File options are not
+/// typed: they take the attached files in order, as attachment `0`, `1`, ...
+pub fn parse_args(options: &[CommandOption], text: &str, files: usize) -> Result<Vec<Value>, String> {
     let text = text.trim();
+    let typed: Vec<usize> = (0..options.len()).filter(|&ix| options[ix].kind != ATTACHMENT).collect();
     let mut values: Vec<(usize, String)> = Vec::new();
 
     // Find `name:` markers that start a word.
     let mut markers: Vec<(usize, usize, usize)> = Vec::new(); // (start, value start, option index)
-    for (ix, option) in options.iter().enumerate() {
+    for &ix in &typed {
+        let option = &options[ix];
         let needle = format!("{}:", option.name);
         let mut from = 0;
         while let Some(found) = text[from..].find(&needle) {
@@ -175,30 +187,35 @@ pub fn parse_args(options: &[CommandOption], text: &str) -> Result<Vec<Value>, S
             values.push((*ix, text[*value_start..end].trim().to_string()));
         }
     } else if !text.is_empty() {
-        match options.len() {
-            0 => {}
-            1 => values.push((0, text.to_string())),
-            n => {
-                let mut rest = text;
-                for ix in 0..n {
-                    rest = rest.trim_start();
-                    if rest.is_empty() {
-                        break;
-                    }
-                    if ix == n - 1 {
-                        values.push((ix, rest.to_string()));
-                    } else {
-                        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-                        values.push((ix, rest[..end].to_string()));
-                        rest = &rest[end..];
-                    }
-                }
+        let n = typed.len();
+        let mut rest = text;
+        for (pos, &ix) in typed.iter().enumerate() {
+            rest = rest.trim_start();
+            if rest.is_empty() {
+                break;
+            }
+            if pos == n - 1 {
+                values.push((ix, rest.to_string()));
+            } else {
+                let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                values.push((ix, rest[..end].to_string()));
+                rest = &rest[end..];
             }
         }
     }
 
     let mut out = Vec::new();
+    let mut next_file = 0;
     for (ix, option) in options.iter().enumerate() {
+        if option.kind == ATTACHMENT {
+            if next_file < files {
+                out.push(json!({ "type": option.kind, "name": option.name, "value": next_file.to_string() }));
+                next_file += 1;
+            } else if option.required {
+                return Err(format!("`{}` takes a file. Attach one with the paperclip button, then run the command.", option.name));
+            }
+            continue;
+        }
         match values.iter().find(|(i, v)| *i == ix && !v.is_empty()) {
             Some((_, value)) => {
                 out.push(json!({ "type": option.kind, "name": option.name, "value": convert(option, value)? }))
@@ -210,9 +227,14 @@ pub fn parse_args(options: &[CommandOption], text: &str) -> Result<Vec<Value>, S
     Ok(out)
 }
 
-/// Builds the `data` object of a chat-input interaction.
-pub fn interaction_data(command: &SlashCommand, args: &str) -> Result<Value, String> {
-    let mut options = Value::Array(parse_args(&command.options, args)?);
+/// Builds the `data` object of a chat-input interaction. `files` are the
+/// names of attached files; only as many as the command takes are used, and
+/// they must be uploaded as `files[0]`, `files[1]`, ...
+pub fn interaction_data(command: &SlashCommand, args: &str, files: &[String]) -> Result<Value, String> {
+    let used = files.len().min(command.file_options());
+    let mut options = Value::Array(parse_args(&command.options, args, used)?);
+    let attachments: Vec<Value> =
+        files[..used].iter().enumerate().map(|(i, name)| json!({ "id": i.to_string(), "filename": name })).collect();
     for (depth, name) in command.path.iter().rev().enumerate() {
         // The innermost path element is the subcommand; any outer one is its group.
         let kind = if depth == 0 { SUBCOMMAND } else { SUBCOMMAND_GROUP };
@@ -225,7 +247,7 @@ pub fn interaction_data(command: &SlashCommand, args: &str) -> Result<Value, Str
         "type": 1,
         "options": options,
         "application_command": command.raw,
-        "attachments": [],
+        "attachments": attachments,
     }))
 }
 
@@ -253,6 +275,11 @@ mod tests {
                     ]},
                 ]},
                 { "id": "3", "application_id": "7", "type": 2, "name": "Inspect user" },
+                { "id": "4", "application_id": "7", "version": "9", "type": 1, "name": "upload",
+                  "description": "Upload", "options": [
+                    { "type": 11, "name": "image", "required": true },
+                    { "type": 3, "name": "caption" },
+                ]},
             ],
         })
     }
@@ -260,7 +287,8 @@ mod tests {
     #[test]
     fn index_is_flattened_and_sorted() {
         let names: Vec<_> = parse_index(&index()).iter().map(SlashCommand::full_name).collect();
-        assert_eq!(names, ["alerts list", "alerts rules add", "forecast"]);
+        assert_eq!(names, ["alerts list", "alerts rules add", "forecast", "upload"]);
+        assert_eq!(parse_index(&index())[3].usage(), "image: <file> [caption:]");
         assert_eq!(parse_index(&index())[2].app_name, "Weather");
         assert_eq!(parse_index(&index())[2].usage(), "city: [days:]");
     }
@@ -268,28 +296,28 @@ mod tests {
     #[test]
     fn named_and_positional_arguments() {
         let forecast = &parse_index(&index())[2];
-        let named = parse_args(&forecast.options, "days: 3 city: New York").unwrap();
+        let named = parse_args(&forecast.options, "days: 3 city: New York", 0).unwrap();
         assert_eq!(named, vec![
             json!({ "type": 3, "name": "city", "value": "New York" }),
             json!({ "type": 4, "name": "days", "value": 3 }),
         ]);
-        let positional = parse_args(&forecast.options, "Paris 5").unwrap();
+        let positional = parse_args(&forecast.options, "Paris 5", 0).unwrap();
         assert_eq!(positional[0]["value"], "Paris");
         assert_eq!(positional[1]["value"], 5);
-        assert_eq!(parse_args(&forecast.options, "Paris").unwrap().len(), 1);
+        assert_eq!(parse_args(&forecast.options, "Paris", 0).unwrap().len(), 1);
     }
 
     #[test]
     fn argument_errors_are_reported() {
         let forecast = &parse_index(&index())[2];
-        assert!(parse_args(&forecast.options, "").unwrap_err().contains("city"));
-        assert!(parse_args(&forecast.options, "city: Rome days: soon").unwrap_err().contains("whole number"));
+        assert!(parse_args(&forecast.options, "", 0).unwrap_err().contains("city"));
+        assert!(parse_args(&forecast.options, "city: Rome days: soon", 0).unwrap_err().contains("whole number"));
     }
 
     #[test]
     fn subcommands_nest_in_the_payload() {
         let add = &parse_index(&index())[1];
-        let data = interaction_data(add, "channel: <#555> loud: yes").unwrap();
+        let data = interaction_data(add, "channel: <#555> loud: yes", &[]).unwrap();
         assert_eq!(data["name"], "alerts");
         let group = &data["options"][0];
         assert_eq!((group["type"].as_u64(), group["name"].as_str()), (Some(2), Some("rules")));
@@ -297,5 +325,18 @@ mod tests {
         assert_eq!((sub["type"].as_u64(), sub["name"].as_str()), (Some(1), Some("add")));
         assert_eq!(sub["options"][0]["value"], "555");
         assert_eq!(sub["options"][1]["value"], true);
+    }
+
+    #[test]
+    fn files_fill_attachment_options() {
+        let upload = &parse_index(&index())[3];
+        assert!(interaction_data(upload, "hello", &[]).unwrap_err().contains("takes a file"));
+        let files = ["a.png".to_string(), "b.png".to_string()];
+        let data = interaction_data(upload, "a sunny day", &files).unwrap();
+        // The typed text goes to the text option, not the file option.
+        assert_eq!(data["options"][0], json!({ "type": 11, "name": "image", "value": "0" }));
+        assert_eq!(data["options"][1]["value"], "a sunny day");
+        // Only as many files as the command takes are sent.
+        assert_eq!(data["attachments"], json!([{ "id": "0", "filename": "a.png" }]));
     }
 }

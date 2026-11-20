@@ -1,10 +1,16 @@
 //! The settings dialog: themes, presence and account.
 
 use super::{
+    form::{self, Field, FormSpec},
     theme::{self, Palette},
     widgets::*,
 };
-use crate::{credentials, discord::Status, settings, store::Store};
+use crate::{
+    credentials,
+    discord::Status,
+    settings,
+    store::{Profile, Store, StoreEvent, image_mime},
+};
 use gpui::{prelude::*, *};
 use gpui_kit::assets::IconName;
 
@@ -28,6 +34,7 @@ impl EventEmitter<SettingsEvent> for SettingsView {}
 impl SettingsView {
     pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        store.update(cx, |store, cx| store.load_my_profile(cx));
         cx.spawn(async move |this, cx| {
             let devices = cx.background_executor().spawn(async { crate::voice::list_devices() }).await;
             let _ = this.update(cx, |this, cx| {
@@ -90,6 +97,67 @@ impl SettingsView {
                     .on_click(cx.listener(move |this, _, _, cx| this.set_device(input, value.clone(), cx)))
             }))
             .into_any_element()
+    }
+
+    fn edit_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        let Some(me) = store.me.clone() else { return };
+        let profile = store.my_profile.clone().unwrap_or_default();
+        let handle = self.store.clone();
+        let spec = FormSpec::new("Edit Profile", "Save", move |result, _, cx| {
+            let [name, pronouns, bio] = <[String; 3]>::try_from(result.values).unwrap_or_default();
+            handle.update(cx, |s, cx| s.edit_profile(name, Profile { bio, pronouns }, cx));
+        })
+        .field(Field::new("Display name", me.global_name.unwrap_or_default()).placeholder(me.username))
+        .field(Field::new("Pronouns", profile.pronouns))
+        .field(Field::new("About me", profile.bio));
+        form::open_form(spec, window, cx);
+    }
+
+    fn change_username(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        let Some(me) = store.me.clone() else { return };
+        let bot = store.is_bot();
+        let handle = self.store.clone();
+        let mut spec = FormSpec::new("Change Username", "Change", move |result, _, cx| {
+            let mut values = result.values.into_iter();
+            let username = values.next().unwrap_or_default();
+            let password = values.next().unwrap_or_default();
+            if username.is_empty() {
+                return;
+            }
+            handle.update(cx, |s, cx| s.change_username(username, password, cx));
+        })
+        .field(Field::new("Username", me.username));
+        if !bot {
+            spec = spec
+                .description("Discord asks for your password to change your username.")
+                .field(Field::new("Current password", "").secret());
+        }
+        form::open_form(spec, window, cx);
+    }
+
+    fn pick_avatar(&mut self, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose avatar".into()),
+        });
+        let store = self.store.clone();
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else { return };
+            let Some(path) = paths.into_iter().next() else { return };
+            let bytes = cx.background_executor().spawn(async move { std::fs::read(path) }).await;
+            let _ = store.update(cx, |store, cx| match bytes {
+                Ok(bytes) => match image_mime(&bytes) {
+                    Some(mime) => store.set_avatar(Some((mime.to_string(), bytes)), cx),
+                    None => cx.emit(StoreEvent::Error("Choose a PNG, JPEG, GIF or WebP image.".into())),
+                },
+                Err(e) => cx.emit(StoreEvent::Error(format!("Could not read the image: {e}"))),
+            });
+        })
+        .detach();
     }
 
     fn open_themes_folder(&mut self, cx: &mut Context<Self>) {
@@ -191,6 +259,8 @@ impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
         let me = store.me.clone();
+        let bot = store.is_bot();
+        let profile = store.my_profile.clone().unwrap_or_default();
         let status = store.my_status;
         let current = theme::current_id();
 
@@ -345,8 +415,23 @@ impl Render for SettingsView {
                                                 .child(me.display_name().to_string()),
                                         )
                                         .child(
-                                            div().text_size(px(12.)).text_color(theme::text_muted()).child(me.tag()),
-                                        ),
+                                            div().text_size(px(12.)).text_color(theme::text_muted()).child(
+                                                if profile.pronouns.is_empty() {
+                                                    me.tag()
+                                                } else {
+                                                    format!("{} \u{b7} {}", me.tag(), profile.pronouns)
+                                                },
+                                            ),
+                                        )
+                                        .when(!profile.bio.is_empty(), |d| {
+                                            d.child(
+                                                div()
+                                                    .pt_1()
+                                                    .text_size(px(12.))
+                                                    .text_color(theme::text())
+                                                    .child(profile.bio.clone()),
+                                            )
+                                        }),
                                 )
                                 .child(
                                     div()
@@ -364,6 +449,30 @@ impl Render for SettingsView {
                                             cx.emit(SettingsEvent::Close);
                                         })),
                                 ),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .when(!bot, |d| {
+                                    d.child(Self::pill("edit-profile", "Edit profile", false).on_click(
+                                        cx.listener(|this, _, window, cx| this.edit_profile(window, cx)),
+                                    ))
+                                })
+                                .child(Self::pill("change-username", "Change username", false).on_click(
+                                    cx.listener(|this, _, window, cx| this.change_username(window, cx)),
+                                ))
+                                .child(
+                                    Self::pill("change-avatar", "Change avatar", false)
+                                        .on_click(cx.listener(|this, _, _, cx| this.pick_avatar(cx))),
+                                )
+                                .when(me.avatar.is_some(), |d| {
+                                    d.child(Self::pill("remove-avatar", "Remove avatar", false).on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.store.update(cx, |s, cx| s.set_avatar(None, cx));
+                                        }),
+                                    ))
+                                }),
                         )
                     }),
             )

@@ -217,6 +217,8 @@ pub struct Store {
     /// Live stages and their topics.
     pub stages: HashMap<Id, String>,
     pub my_status: Status,
+    /// About-me text and pronouns, fetched when settings open (user accounts).
+    pub my_profile: Option<Profile>,
     gateway_session: String,
     /// Relationship type per user: 1 friend, 2 blocked, 3 incoming, 4 outgoing.
     pub relationships: Vec<(Id, u8)>,
@@ -237,6 +239,12 @@ pub struct Store {
 }
 
 impl EventEmitter<StoreEvent> for Store {}
+
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct Profile {
+    pub bio: String,
+    pub pronouns: String,
+}
 
 struct StoreResolver<'a> {
     store: &'a Store,
@@ -292,6 +300,7 @@ impl Store {
             calls: HashMap::new(),
             stages: HashMap::new(),
             my_status: Status::Online,
+            my_profile: None,
             gateway_session: String::new(),
             relationships: Vec::new(),
             muted: crate::settings::Settings::load().muted.into_iter().map(Id).collect(),
@@ -924,6 +933,113 @@ impl Store {
             if let Some(value) = store.report(result, what, cx) {
                 apply(store, value, cx);
             }
+        });
+    }
+
+    // ---------------------------------------------------------------- account
+
+    /// Whether this is a bot account (several profile fields are user-only).
+    pub fn is_bot(&self) -> bool {
+        self.rest.as_ref().is_some_and(Rest::is_bot)
+    }
+
+    fn set_me(&mut self, user: User, cx: &mut Context<Self>) {
+        self.users.insert(user.id, user.clone());
+        self.me = Some(user);
+        cx.emit(StoreEvent::Channels);
+        cx.notify();
+    }
+
+    /// Fetches the about-me text and pronouns, if not already known.
+    pub fn load_my_profile(&mut self, cx: &mut Context<Self>) {
+        if self.my_profile.is_some() {
+            return;
+        }
+        if self.demo || self.is_bot() {
+            self.my_profile = Some(Profile::default());
+            return;
+        }
+        let (Some(rest), Some(me)) = (self.rest.clone(), self.me.as_ref().map(|u| u.id)) else { return };
+        self.run(cx, async move { rest.my_profile(me).await }, |store, result, cx| {
+            let Ok(value) = result else { return };
+            let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+            let p = &value["user_profile"];
+            store.my_profile = Some(Profile { bio: text(&p["bio"]), pronouns: text(&p["pronouns"]) });
+            cx.notify();
+        });
+    }
+
+    /// Saves the display name, and for user accounts the about-me and pronouns.
+    /// Bot accounts have no display name or profile text, so only users get here.
+    pub fn edit_profile(&mut self, display_name: String, profile: Profile, cx: &mut Context<Self>) {
+        let global_name = (!display_name.is_empty()).then_some(display_name);
+        if self.demo {
+            if let Some(mut me) = self.me.clone() {
+                me.global_name = global_name;
+                self.set_me(me, cx);
+            }
+            self.my_profile = Some(profile);
+            cx.emit(StoreEvent::Notice("Profile saved.".into()));
+            return;
+        }
+        let changed_name = self.me.as_ref().map(|m| m.global_name.clone()) != Some(global_name.clone());
+        let changed_profile = self.my_profile.as_ref() != Some(&profile);
+        let saved = profile.clone();
+        self.admin(
+            "Could not save your profile",
+            cx,
+            move |rest| async move {
+                let user = if changed_name {
+                    Some(rest.modify_me(serde_json::json!({ "global_name": global_name })).await?)
+                } else {
+                    None
+                };
+                if changed_profile {
+                    rest.modify_profile(serde_json::json!({ "bio": profile.bio, "pronouns": profile.pronouns })).await?;
+                }
+                Ok(user)
+            },
+            move |store, user, cx| {
+                if let Some(user) = user {
+                    store.set_me(user, cx);
+                }
+                store.my_profile = Some(saved);
+                cx.emit(StoreEvent::Notice("Profile saved.".into()));
+            },
+        );
+    }
+
+    /// Changes the username. User accounts must confirm with their password.
+    pub fn change_username(&mut self, username: String, password: String, cx: &mut Context<Self>) {
+        if self.demo {
+            if let Some(mut me) = self.me.clone() {
+                me.username = username;
+                self.set_me(me, cx);
+            }
+            return;
+        }
+        let body = if self.is_bot() {
+            serde_json::json!({ "username": username })
+        } else {
+            serde_json::json!({ "username": username, "password": password })
+        };
+        self.admin("Could not change your username", cx, move |rest| async move { rest.modify_me(body).await }, |store, user, cx| {
+            store.set_me(user, cx);
+            cx.emit(StoreEvent::Notice("Username changed.".into()));
+        });
+    }
+
+    /// Sets the avatar from image bytes, or removes it with `None`.
+    pub fn set_avatar(&mut self, image: Option<(String, Vec<u8>)>, cx: &mut Context<Self>) {
+        if self.demo {
+            cx.emit(StoreEvent::Notice("Avatars are not uploaded in demo mode.".into()));
+            return;
+        }
+        let avatar = image.map(|(mime, bytes)| data_uri(&mime, &bytes));
+        let body = serde_json::json!({ "avatar": avatar });
+        self.admin("Could not change your avatar", cx, move |rest| async move { rest.modify_me(body).await }, |store, user, cx| {
+            store.set_me(user, cx);
+            cx.emit(StoreEvent::Notice("Avatar updated.".into()));
         });
     }
 
@@ -1719,6 +1835,11 @@ impl Store {
                     ]},
                     { "id": "9002", "application_id": "5", "version": "1", "type": 1, "name": "status",
                       "description": "Show build status", "options": [] },
+                    { "id": "9003", "application_id": "5", "version": "1", "type": 1, "name": "artifact",
+                      "description": "Attach a build artifact", "options": [
+                        { "type": 11, "name": "file", "description": "", "required": true },
+                        { "type": 3, "name": "note", "description": "" },
+                    ]},
                 ],
             });
             self.slash_commands.insert(scope, Rc::new(commands::parse_index(&sample)));
@@ -1742,10 +1863,24 @@ impl Store {
         });
     }
 
-    /// Runs a slash command. Returns false if the arguments were rejected, so
-    /// the caller can leave the text in place for the user to fix.
-    pub fn run_command(&mut self, channel: Id, command: &SlashCommand, args: &str, cx: &mut Context<Self>) -> bool {
-        let data = match commands::interaction_data(command, args) {
+    /// Runs a slash command, uploading `files` for its file options. Returns
+    /// false if the arguments were rejected, so the caller can leave the text
+    /// in place for the user to fix.
+    pub fn run_command(
+        &mut self,
+        channel: Id,
+        command: &SlashCommand,
+        args: &str,
+        files: Vec<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut files = files;
+        files.truncate(command.file_options());
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().map_or_else(|| "file".into(), |n| n.to_string_lossy().into_owned()))
+            .collect();
+        let data = match commands::interaction_data(command, args, &names) {
             Ok(data) => data,
             Err(reason) => {
                 cx.emit(StoreEvent::Error(reason));
@@ -1753,7 +1888,15 @@ impl Store {
             }
         };
         if self.demo {
-            cx.emit(StoreEvent::Notice(format!("/{} was accepted. Demo mode does not run commands.", command.full_name())));
+            let with = match names.len() {
+                0 => String::new(),
+                1 => format!(" with {}", names[0]),
+                n => format!(" with {n} files"),
+            };
+            cx.emit(StoreEvent::Notice(format!(
+                "/{}{with} was accepted. Demo mode does not run commands.",
+                command.full_name()
+            )));
             return true;
         }
         let Some(rest) = self.rest.clone() else { return false };
@@ -1767,9 +1910,23 @@ impl Store {
             "nonce": Id::now().to_string(),
             "data": data,
         });
-        self.run(cx, async move { rest.interact(payload).await }, |store, result, cx| {
-            store.report(result, "The command failed", cx);
-        });
+        let read = move || -> Result<Vec<Upload>> {
+            files
+                .into_iter()
+                .zip(names)
+                .map(|(path, filename)| Ok(Upload { filename, bytes: std::fs::read(path)? }))
+                .collect()
+        };
+        self.run(
+            cx,
+            async move {
+                let uploads = tokio::task::spawn_blocking(read).await??;
+                rest.interact(payload, uploads).await
+            },
+            |store, result, cx| {
+                store.report(result, "The command failed", cx);
+            },
+        );
         true
     }
 
@@ -1963,7 +2120,7 @@ impl Store {
             "session_id": self.gateway_session,
             "data": data,
         });
-        self.run(cx, async move { rest.interact(payload).await }, |store, result, cx| {
+        self.run(cx, async move { rest.interact(payload, Vec::new()).await }, |store, result, cx| {
             store.report(result, "The interaction failed", cx);
         });
     }
@@ -2751,6 +2908,11 @@ impl Store {
                 }
                 self.member_info.remove(&(guild_id, user_id));
                 cx.emit(StoreEvent::Members(guild_id));
+            }
+            Event::UserUpdate(user) => {
+                if self.me.as_ref().is_some_and(|me| me.id == user.id) {
+                    self.set_me(*user, cx);
+                }
             }
             Event::Presence { user_id, status } => {
                 self.presences.insert(user_id, status);

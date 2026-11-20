@@ -1,6 +1,6 @@
 //! Minimal Discord REST client with rate-limit handling.
 
-use super::model::{Ban, Channel, Gif, Id, Message, Role};
+use super::model::{Ban, Channel, Gif, Id, Message, Role, User};
 use anyhow::{Result, anyhow};
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde_json::{Value, json};
@@ -234,8 +234,22 @@ impl Rest {
 
     /// Sends an interaction (button press, select choice, slash command).
     /// User accounts only; this endpoint is not part of the documented API.
-    pub async fn interact(&self, payload: Value) -> Result<()> {
-        self.send(|| self.request(Method::POST, "/interactions").json(&payload)).await?;
+    pub async fn interact(&self, payload: Value, uploads: Vec<Upload>) -> Result<()> {
+        if uploads.is_empty() {
+            self.send(|| self.request(Method::POST, "/interactions").json(&payload)).await?;
+            return Ok(());
+        }
+        let mut form = reqwest::multipart::Form::new().text("payload_json", payload.to_string());
+        for (i, up) in uploads.into_iter().enumerate() {
+            form = form.part(format!("files[{i}]"), reqwest::multipart::Part::bytes(up.bytes).file_name(up.filename));
+        }
+        let resp = self.request(Method::POST, "/interactions").multipart(form).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            let msg = body["message"].as_str().unwrap_or("upload failed");
+            return Err(anyhow!("{msg} (HTTP {})", status.as_u16()));
+        }
         Ok(())
     }
 
@@ -461,6 +475,22 @@ impl Rest {
     pub async fn bans(&self, guild: Id) -> Result<Vec<Ban>> {
         let path = format!("/guilds/{guild}/bans?limit=1000");
         Ok(self.send(|| self.request(Method::GET, &path)).await?.json().await?)
+    }
+
+    /// Changes the account's username, display name or avatar.
+    pub async fn modify_me(&self, body: Value) -> Result<User> {
+        Ok(self.send(|| self.request(Method::PATCH, "/users/@me").json(&body)).await?.json().await?)
+    }
+
+    /// The account's profile: about-me text and pronouns (user accounts only).
+    pub async fn my_profile(&self, me: Id) -> Result<Value> {
+        let path = format!("/users/{me}/profile");
+        Ok(self.send(|| self.request(Method::GET, &path)).await?.json().await?)
+    }
+
+    pub async fn modify_profile(&self, body: Value) -> Result<()> {
+        self.send(|| self.request(Method::PATCH, "/users/@me/profile").json(&body)).await?;
+        Ok(())
     }
 
     pub async fn open_dm(&self, user: Id) -> Result<Channel> {

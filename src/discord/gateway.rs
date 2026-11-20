@@ -87,6 +87,8 @@ pub enum Event {
     /// Someone's nickname, roles or timeout changed.
     MemberUpdate { guild_id: Id, member: Member },
     MemberRemove { guild_id: Id, user_id: Id },
+    /// The account's own user object changed.
+    UserUpdate(Box<User>),
 }
 
 #[derive(Debug)]
@@ -497,6 +499,7 @@ fn dispatch(state: &mut State, kind: &str, mut d: Value) -> Vec<Event> {
             }
             _ => vec![],
         },
+        "USER_UPDATE" => one(parse::<User>(d, kind).map(|u| Event::UserUpdate(Box::new(u)))),
         "PRESENCE_UPDATE" => one(id_of(&d["user"]["id"]).map(|user_id| Event::Presence {
             user_id,
             status: Status::parse(d["status"].as_str().unwrap_or("offline")),

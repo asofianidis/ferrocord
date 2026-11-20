@@ -374,8 +374,11 @@ impl ChatView {
             return;
         }
 
-        if let Some(accepted) = self.try_command(channel, &content, cx) {
+        if let Some((accepted, used_files)) = self.try_command(channel, &content, cx) {
             if accepted {
+                if used_files {
+                    self.uploads.clear();
+                }
                 self.composer.update(cx, |s, cx| s.set_value("", window, cx));
             } else {
                 // Keep the friendly names working for the retry.
@@ -826,9 +829,10 @@ impl ChatView {
         (!items.is_empty()).then_some(Completion { start: 0, items, selected: 0 })
     }
 
-    /// Runs the composer text as a slash command if it names one.
-    /// Returns `None` when the text is not a known command.
-    fn try_command(&mut self, channel: Id, content: &str, cx: &mut Context<Self>) -> Option<bool> {
+    /// Runs the composer text as a slash command if it names one, passing the
+    /// attached files to its file options. Returns `None` when the text is not
+    /// a known command, otherwise whether it was accepted and used the files.
+    fn try_command(&mut self, channel: Id, content: &str, cx: &mut Context<Self>) -> Option<(bool, bool)> {
         let typed = content.strip_prefix('/')?;
         let commands = self.store.read(cx).commands_for(channel)?;
         let command = commands
@@ -840,7 +844,10 @@ impl ChatView {
             .max_by_key(|c| c.full_name().len())?
             .clone();
         let args = typed[command.full_name().len()..].to_string();
-        Some(self.store.update(cx, |store, cx| store.run_command(channel, &command, &args, cx)))
+        let files = self.uploads.clone();
+        let used_files = command.file_options() > 0 && !files.is_empty();
+        let accepted = self.store.update(cx, |store, cx| store.run_command(channel, &command, &args, files, cx));
+        Some((accepted, used_files))
     }
 
     fn accept_completion(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
