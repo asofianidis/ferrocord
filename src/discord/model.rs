@@ -237,6 +237,8 @@ pub struct Channel {
     pub icon: Option<String>,
     #[serde(default)]
     pub owner_id: Option<Id>,
+    #[serde(default, deserialize_with = "de_null")]
+    pub message_count: u32,
 }
 
 impl Channel {
@@ -246,6 +248,10 @@ impl Channel {
             self.kind,
             TEXT | DM | GROUP_DM | ANNOUNCEMENT | ANNOUNCEMENT_THREAD | PUBLIC_THREAD | PRIVATE_THREAD | VOICE | STAGE
         )
+    }
+
+    pub fn is_forum(&self) -> bool {
+        matches!(self.kind, channel_kind::FORUM | channel_kind::MEDIA)
     }
 
     pub fn is_thread(&self) -> bool {
@@ -552,6 +558,148 @@ pub struct Message {
     pub sticker_items: Vec<StickerItem>,
     #[serde(default)]
     pub nonce: Option<serde_json::Value>,
+    #[serde(default)]
+    pub poll: Option<Poll>,
+    #[serde(default, deserialize_with = "de_null")]
+    pub message_snapshots: Vec<Snapshot>,
+    #[serde(default, deserialize_with = "de_null")]
+    pub components: Vec<Component>,
+    #[serde(default, deserialize_with = "de_null")]
+    pub flags: u64,
+    #[serde(default)]
+    pub application_id: Option<Id>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct PollMedia {
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub emoji: Option<Emoji>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct PollAnswer {
+    #[serde(default, deserialize_with = "de_null")]
+    pub answer_id: u32,
+    #[serde(default)]
+    pub poll_media: PollMedia,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct PollCount {
+    #[serde(default, deserialize_with = "de_null")]
+    pub id: u32,
+    #[serde(default, deserialize_with = "de_null")]
+    pub count: u32,
+    #[serde(default, deserialize_with = "de_null")]
+    pub me_voted: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct PollResults {
+    #[serde(default, deserialize_with = "de_null")]
+    pub is_finalized: bool,
+    #[serde(default, deserialize_with = "de_null")]
+    pub answer_counts: Vec<PollCount>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Poll {
+    #[serde(default)]
+    pub question: PollMedia,
+    #[serde(default, deserialize_with = "de_null")]
+    pub answers: Vec<PollAnswer>,
+    #[serde(default)]
+    pub results: Option<PollResults>,
+    #[serde(default, deserialize_with = "de_null")]
+    pub allow_multiselect: bool,
+}
+
+impl Poll {
+    pub fn count(&self, answer: u32) -> (u32, bool) {
+        self.results
+            .as_ref()
+            .and_then(|r| r.answer_counts.iter().find(|c| c.id == answer))
+            .map_or((0, false), |c| (c.count, c.me_voted))
+    }
+
+    /// Applies one vote change, creating the tally entry when needed.
+    pub fn apply_vote(&mut self, answer: u32, added: bool, mine: bool) {
+        let results = self.results.get_or_insert_with(Default::default);
+        let index = match results.answer_counts.iter().position(|c| c.id == answer) {
+            Some(index) => index,
+            None => {
+                results.answer_counts.push(PollCount { id: answer, ..Default::default() });
+                results.answer_counts.len() - 1
+            }
+        };
+        let entry = &mut results.answer_counts[index];
+        entry.count = if added { entry.count + 1 } else { entry.count.saturating_sub(1) };
+        if mine {
+            entry.me_voted = added;
+        }
+    }
+}
+
+/// The content of a forwarded message.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct SnapshotMessage {
+    #[serde(default, deserialize_with = "de_null")]
+    pub content: String,
+    #[serde(default, deserialize_with = "de_null")]
+    pub attachments: Vec<Attachment>,
+    #[serde(default, deserialize_with = "de_null")]
+    pub embeds: Vec<Embed>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Snapshot {
+    #[serde(default)]
+    pub message: SnapshotMessage,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct SelectOption {
+    #[serde(default, deserialize_with = "de_null")]
+    pub label: String,
+    #[serde(default, deserialize_with = "de_null")]
+    pub value: String,
+}
+
+pub mod component_kind {
+    pub const ACTION_ROW: u8 = 1;
+    pub const BUTTON: u8 = 2;
+    pub const STRING_SELECT: u8 = 3;
+    pub const TEXT_DISPLAY: u8 = 10;
+    pub const LINK_STYLE: u8 = 5;
+}
+
+/// A message component: an action row, button, select menu or text block.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct Component {
+    #[serde(default, rename = "type", deserialize_with = "de_null")]
+    pub kind: u8,
+    #[serde(default, deserialize_with = "de_null")]
+    pub components: Vec<Component>,
+    #[serde(default, deserialize_with = "de_null")]
+    pub style: u8,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub custom_id: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default, deserialize_with = "de_null")]
+    pub disabled: bool,
+    #[serde(default)]
+    pub emoji: Option<Emoji>,
+    #[serde(default)]
+    pub placeholder: Option<String>,
+    #[serde(default, deserialize_with = "de_null")]
+    pub options: Vec<SelectOption>,
+    #[serde(default)]
+    pub content: Option<String>,
 }
 
 impl Message {

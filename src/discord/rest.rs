@@ -194,6 +194,51 @@ impl Rest {
         Ok(hits)
     }
 
+    /// Archived posts of a forum (active ones arrive over the gateway).
+    pub async fn forum_threads(&self, forum: Id) -> Result<Vec<Channel>> {
+        let path = if self.inner.is_bot {
+            format!("/channels/{forum}/threads/archived/public?limit=50")
+        } else {
+            format!(
+                "/channels/{forum}/threads/search?archived=true&sort_by=last_message_time&sort_order=desc&limit=25&offset=0"
+            )
+        };
+        let mut body: Value = self.send(|| self.request(Method::GET, &path)).await?.json().await?;
+        let threads = match body["threads"].take() {
+            Value::Array(list) => list.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect(),
+            _ => Vec::new(),
+        };
+        Ok(threads)
+    }
+
+    pub async fn create_thread(&self, channel: Id, message: Id, name: &str) -> Result<Channel> {
+        let path = format!("/channels/{channel}/messages/{message}/threads");
+        let body = json!({ "name": name, "auto_archive_duration": 1440 });
+        Ok(self.send(|| self.request(Method::POST, &path).json(&body)).await?.json().await?)
+    }
+
+    pub async fn create_post(&self, forum: Id, title: &str, content: &str) -> Result<Channel> {
+        let path = format!("/channels/{forum}/threads");
+        let body = json!({ "name": title, "auto_archive_duration": 4320, "message": { "content": content } });
+        Ok(self.send(|| self.request(Method::POST, &path).json(&body)).await?.json().await?)
+    }
+
+    /// Replaces the current user's votes on a poll. User accounts only.
+    pub async fn vote_poll(&self, channel: Id, message: Id, answers: &[u32]) -> Result<()> {
+        let path = format!("/channels/{channel}/polls/{message}/answers/@me");
+        let ids: Vec<String> = answers.iter().map(|a| a.to_string()).collect();
+        let body = json!({ "answer_ids": ids });
+        self.send(|| self.request(Method::PUT, &path).json(&body)).await?;
+        Ok(())
+    }
+
+    /// Sends an interaction (button press, select choice, slash command).
+    /// User accounts only; this endpoint is not part of the documented API.
+    pub async fn interact(&self, payload: Value) -> Result<()> {
+        self.send(|| self.request(Method::POST, "/interactions").json(&payload)).await?;
+        Ok(())
+    }
+
     pub async fn open_dm(&self, user: Id) -> Result<Channel> {
         let body = json!({ "recipient_id": user.to_string() });
         Ok(self

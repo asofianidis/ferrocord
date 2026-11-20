@@ -7,7 +7,10 @@ use super::{
     widgets::*,
 };
 use crate::{
-    discord::{Attachment, Embed, Emoji, Id, Message, channel_kind, message_kind, rest::Upload},
+    discord::{
+        Attachment, Component, Embed, Emoji, Id, Message, Poll, channel_kind, component_kind, message_kind,
+        rest::Upload,
+    },
     emoji, markdown,
     store::{MessageChange, Msg, Store, StoreEvent},
 };
@@ -104,6 +107,8 @@ pub struct ChatView {
     replacements: Vec<(String, String)>,
     profile: Option<Id>,
     flash: Option<Id>,
+    post_title: Entity<InputState>,
+    post_body: Entity<InputState>,
     last_typing: Option<Instant>,
     _subs: Vec<Subscription>,
 }
@@ -116,6 +121,8 @@ impl ChatView {
         });
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
         let picker_query = cx.new(|cx| InputState::new(window, cx).placeholder("Find an emoji"));
+        let post_title = cx.new(|cx| InputState::new(window, cx).placeholder("Post title"));
+        let post_body = cx.new(|cx| InputState::new(window, cx).placeholder("Say something to start the post"));
         let subs = vec![
             cx.subscribe_in(&store, window, Self::on_store_event),
             cx.subscribe_in(&composer, window, Self::on_input),
@@ -149,6 +156,8 @@ impl ChatView {
             replacements: Vec::new(),
             profile: None,
             flash: None,
+            post_title,
+            post_body,
             last_typing: None,
             _subs: subs,
         };
@@ -560,6 +569,112 @@ impl ChatView {
             });
         })
         .detach();
+    }
+
+    // ------------------------------------------------------------ forums
+
+    fn create_post(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(forum) = self.channel else { return };
+        let title = self.post_title.read(cx).value().trim().to_string();
+        let body = self.post_body.read(cx).value().trim().to_string();
+        if title.is_empty() || body.is_empty() {
+            self.store.update(cx, |_, cx| {
+                cx.emit(StoreEvent::Error("A post needs both a title and a message.".into()));
+            });
+            return;
+        }
+        self.post_title.update(cx, |s, cx| s.set_value("", window, cx));
+        self.post_body.update(cx, |s, cx| s.set_value("", window, cx));
+        self.store.update(cx, |store, cx| store.create_post(forum, title, body, cx));
+    }
+
+    fn render_forum(&self, cx: &mut Context<Self>) -> AnyElement {
+        let store = self.store.read(cx);
+        let Some(forum) = self.channel else { return div().into_any_element() };
+        let guild = store.channels.get(&forum).and_then(|c| c.guild_id);
+        let can_post = store.can_send(forum);
+        let posts: Vec<_> = store
+            .forum_posts(forum)
+            .into_iter()
+            .map(|post| {
+                let owner = post
+                    .owner_id
+                    .and_then(|id| store.users.get(&id))
+                    .map(|user| store.display_name(guild, user))
+                    .unwrap_or_else(|| "Unknown".into());
+                let active = post.last_message_id.unwrap_or(post.id).time();
+                (post.id, post.name.clone().unwrap_or_default(), owner, post.message_count, active, store.is_unread(post.id))
+            })
+            .collect();
+
+        v_flex()
+            .id("forum")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_4()
+            .gap_2()
+            .when(can_post, |d| {
+                d.child(
+                    h_flex()
+                        .gap_2()
+                        .p_2()
+                        .rounded_lg()
+                        .bg(theme::bg_input())
+                        .child(div().w(px(240.)).flex_shrink_0().child(Input::new(&self.post_title)))
+                        .child(div().flex_1().min_w_0().child(Input::new(&self.post_body)))
+                        .child(
+                            div()
+                                .id("new-post")
+                                .px_3()
+                                .py_1p5()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .bg(theme::accent())
+                                .text_color(theme::on_accent())
+                                .child("Post")
+                                .on_click(cx.listener(|this, _, window, cx| this.create_post(window, cx))),
+                        ),
+                )
+            })
+            .when(posts.is_empty(), |d| {
+                d.child(div().p_4().text_color(theme::text_muted()).child("No posts yet."))
+            })
+            .children(posts.into_iter().map(|(id, name, owner, count, active, unread)| {
+                v_flex()
+                    .id(("post", id.0))
+                    .p_3()
+                    .gap_1()
+                    .rounded_lg()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(theme::border())
+                    .bg(theme::bg_sidebar())
+                    .hover(|s| s.bg(theme::bg_hover()))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .when(unread, |d| d.child(div().size(px(8.)).rounded_full().bg(theme::accent())))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_bright())
+                                    .child(name),
+                            ),
+                    )
+                    .child(div().text_size(px(12.)).text_color(theme::text_muted()).child(format!(
+                        "{owner} \u{00b7} {count} message{} \u{00b7} active {}",
+                        if count == 1 { "" } else { "s" },
+                        format_stamp(active).to_lowercase()
+                    )))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store.update(cx, |store, cx| store.select_channel(id, cx));
+                    }))
+            }))
+            .into_any_element()
     }
 
     // ------------------------------------------------------------ autocomplete
@@ -1158,6 +1273,51 @@ impl ChatView {
         for (i, embed) in m.embeds.iter().enumerate() {
             body = body.child(render_embed(i, embed, mono.clone(), opener.clone()));
         }
+        if let Some(poll) = &m.poll {
+            let this = this.clone();
+            body = body.child(render_poll(poll, Rc::new(move |answer, cx| {
+                this.update(cx, |this, cx| {
+                    this.store.update(cx, |s, cx| s.vote_poll(channel_id, id, answer, cx));
+                });
+            })));
+        }
+        for (i, snapshot) in m.message_snapshots.iter().enumerate() {
+            let inner = &snapshot.message;
+            let doc = markdown::parse(&inner.content, &markdown::NoResolver);
+            let mut quoted = v_flex().flex_1().min_w_0().gap(px(2.)).child(
+                h_flex()
+                    .gap_1()
+                    .text_size(px(12.))
+                    .text_color(theme::text_muted())
+                    .child(icon(IconName::CornerUpRight, 12., theme::text_muted()))
+                    .child("Forwarded"),
+            );
+            quoted = quoted.children(rich::render_doc(&doc, true, None, mono.clone()));
+            for (j, attachment) in inner.attachments.iter().enumerate() {
+                quoted = quoted.child(render_attachment(1000 + i * 100 + j, attachment, opener.clone()));
+            }
+            for (j, embed) in inner.embeds.iter().enumerate() {
+                quoted = quoted.child(render_embed(1000 + i * 100 + j, embed, mono.clone(), opener.clone()));
+            }
+            body = body.child(
+                h_flex()
+                    .w_full()
+                    .items_stretch()
+                    .gap_2()
+                    .child(div().w(px(4.)).flex_shrink_0().rounded_sm().bg(theme::bg_active()))
+                    .child(quoted),
+            );
+        }
+        if !m.components.is_empty() {
+            let this = this.clone();
+            body = body.child(render_components(&m.components, Rc::new(move |component, value, cx| {
+                let Some(custom_id) = component.custom_id.clone() else { return };
+                let kind = component.kind;
+                this.update(cx, |this, cx| {
+                    this.store.update(cx, |s, cx| s.interact(channel_id, id, custom_id, kind, value, cx));
+                });
+            })));
+        }
         if !m.reactions.is_empty() {
             body = body.child(h_flex().flex_wrap().gap_1().pt_1().children(m.reactions.iter().enumerate().map(
                 |(i, reaction)| {
@@ -1312,6 +1472,13 @@ impl ChatView {
         let menu = {
             let this = this.clone();
             let content = m.content.clone();
+            let in_guild = guild.is_some();
+            let is_thread_channel = store.channels.get(&channel_id).is_some_and(|c| c.is_thread());
+            // Discord suggests the message's own opening words as the thread name.
+            let thread_name = {
+                let first: String = m.content.lines().next().unwrap_or("").chars().take(60).collect();
+                if first.trim().is_empty() { format!("Thread with {name}") } else { first }
+            };
             let pinned = m.pinned;
             let pending = msg.pending;
             move |mut menu: gpui_component::menu::PopupMenu, _: &mut Window, _: &mut Context<_>| {
@@ -1335,6 +1502,16 @@ impl ChatView {
                         let emoji = Emoji { name: Some(emoji.to_string()), ..Default::default() };
                         entity.update(cx, |this, cx| {
                             this.store.update(cx, |s, cx| s.toggle_reaction(channel_id, id, emoji, cx));
+                        });
+                    }));
+                }
+                if in_guild && !is_thread_channel {
+                    let entity = this.clone();
+                    let name = thread_name.clone();
+                    menu = menu.item(PopupMenuItem::new("Create Thread").on_click(move |_, _, cx| {
+                        let name = name.clone();
+                        entity.update(cx, |this, cx| {
+                            this.store.update(cx, |s, cx| s.create_thread(channel_id, id, name, cx));
                         });
                     }));
                 }
@@ -1406,6 +1583,8 @@ impl ChatView {
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
         let channel = self.channel.and_then(|c| store.channels.get(&c));
+        let parent = channel.filter(|c| c.is_thread()).and_then(|c| c.parent_id).and_then(|p| store.channels.get(&p));
+        let parent_link = parent.map(|p| (p.id, store.channel_title(p)));
         let (kind, title, topic, in_guild) = match channel {
             Some(c) => (
                 c.kind,
@@ -1426,6 +1605,23 @@ impl ChatView {
             .border_b_1()
             .border_color(theme::border())
             .child(icon(channel_icon(kind), 18., theme::text_muted()))
+            .when_some(parent_link, |d, (parent_id, parent_title)| {
+                d.child(
+                    div()
+                        .id("parent-channel")
+                        .flex_shrink_0()
+                        .max_w(px(180.))
+                        .truncate()
+                        .cursor_pointer()
+                        .text_color(theme::text_muted())
+                        .hover(|s| s.text_color(theme::text()))
+                        .child(parent_title)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.store.update(cx, |store, cx| store.select_channel(parent_id, cx));
+                        })),
+                )
+                .child(icon(IconName::ChevronRight, 14., theme::text_muted()))
+            })
             .child(
                 div()
                     .flex_shrink_0()
@@ -1718,7 +1914,11 @@ impl Render for ChatView {
         let this = cx.entity();
         let has_channel = self.channel.is_some();
 
-        let list = if has_channel {
+        let is_forum =
+            self.channel.and_then(|c| self.store.read(cx).channels.get(&c)).is_some_and(|c| c.is_forum());
+        let list = if is_forum {
+            self.render_forum(cx)
+        } else if has_channel {
             let key = self.channel.map_or(0, |c| c.0);
             // Images are retained per channel, so switching channels frees them.
             image_cache(retain_all(("chat-images", key)))
@@ -1789,7 +1989,7 @@ impl Render for ChatView {
             }))
             .child(self.render_header(cx))
             .child(list)
-            .child(self.render_composer(cx))
+            .when(!is_forum, |d| d.child(self.render_composer(cx)))
             .when_some(self.completion.as_ref(), |d, completion| d.child(self.render_completion(completion, cx)))
             .when(picker_open, |d| d.child(self.render_picker(cx)))
             .when_some(panel, |d, panel| d.child(self.render_panel(&panel, cx)))
@@ -2008,4 +2208,186 @@ fn render_embed(ix: usize, embed: &Embed, mono: SharedString, opener: Opener) ->
         .child(div().w(px(4.)).flex_shrink_0().bg(bar))
         .child(h_flex().flex_1().min_w_0().items_start().gap_3().p_3().child(column).children(thumbnail))
         .into_any_element()
+}
+
+fn render_poll(poll: &Poll, on_vote: Rc<dyn Fn(u32, &mut App)>) -> AnyElement {
+    let total: u32 = poll.answers.iter().map(|a| poll.count(a.answer_id).0).sum();
+    let closed = poll.results.as_ref().is_some_and(|r| r.is_finalized);
+    v_flex()
+        .mt_1()
+        .max_w(px(440.))
+        .p_3()
+        .gap_2()
+        .rounded_lg()
+        .border_1()
+        .border_color(theme::border())
+        .bg(theme::bg_sidebar())
+        .child(
+            div()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme::text_bright())
+                .child(poll.question.text.clone().unwrap_or_default()),
+        )
+        .children(poll.answers.iter().map(|answer| {
+            let (count, mine) = poll.count(answer.answer_id);
+            let share = if total == 0 { 0. } else { count as f32 / total as f32 };
+            let id = answer.answer_id;
+            let on_vote = on_vote.clone();
+            let glyph = answer.poll_media.emoji.as_ref().and_then(|e| e.name.clone()).filter(|_| {
+                answer.poll_media.emoji.as_ref().is_some_and(|e| e.id.is_none())
+            });
+            div()
+                .id(("poll-answer", id as usize))
+                .relative()
+                .h(px(36.))
+                .rounded_md()
+                .overflow_hidden()
+                .border_1()
+                .border_color(if mine { theme::accent() } else { theme::border() })
+                .bg(theme::bg_input())
+                .when(!closed, |d| d.cursor_pointer().hover(|s| s.border_color(theme::text_muted())))
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .h_full()
+                        .w(relative(share))
+                        .bg(theme::accent().opacity(if mine { 0.35 } else { 0.18 })),
+                )
+                .child(
+                    h_flex()
+                        .absolute()
+                        .inset_0()
+                        .px_3()
+                        .gap_2()
+                        .children(glyph)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(theme::text())
+                                .child(answer.poll_media.text.clone().unwrap_or_default()),
+                        )
+                        .when(mine, |d| d.child(icon(IconName::Check, 14., theme::accent_text())))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme::text_muted())
+                                .child(format!("{count} \u{00b7} {:.0}%", share * 100.)),
+                        ),
+                )
+                .on_click(move |_, _, cx| {
+                    if !closed {
+                        on_vote(id, cx)
+                    }
+                })
+        }))
+        .child(div().text_size(px(12.)).text_color(theme::text_muted()).child(format!(
+            "{total} vote{}{}{}",
+            if total == 1 { "" } else { "s" },
+            if poll.allow_multiselect { " \u{00b7} choose any" } else { "" },
+            if closed { " \u{00b7} closed" } else { "" }
+        )))
+        .into_any_element()
+}
+
+fn render_components(rows: &[Component], on_press: Rc<dyn Fn(&Component, Option<String>, &mut App)>) -> AnyElement {
+    let mut key = 0usize;
+    let mut next_key = || {
+        key += 1;
+        key
+    };
+    let mut column = v_flex().mt_1().gap_1p5();
+    for row in rows {
+        // Text blocks may appear at the top level; everything else sits in rows.
+        if row.kind == component_kind::TEXT_DISPLAY {
+            column = column.child(div().child(row.content.clone().unwrap_or_default()));
+            continue;
+        }
+        let mut line = h_flex().flex_wrap().gap_2();
+        for component in &row.components {
+            match component.kind {
+                component_kind::BUTTON => {
+                    let is_link = component.style == component_kind::LINK_STYLE;
+                    let (bg, fg) = match component.style {
+                        1 => (theme::accent(), theme::on_accent()),
+                        3 => (theme::online(), gpui::white()),
+                        4 => (theme::danger(), gpui::white()),
+                        _ => (theme::bg_active(), theme::text_bright()),
+                    };
+                    let glyph = component.emoji.as_ref().filter(|e| e.id.is_none()).and_then(|e| e.name.clone());
+                    let pressed = component.clone();
+                    let on_press = on_press.clone();
+                    line = line.child(
+                        h_flex()
+                            .id(("component", next_key()))
+                            .h(px(32.))
+                            .px_3()
+                            .gap_1p5()
+                            .rounded_md()
+                            .bg(bg)
+                            .text_color(fg)
+                            .font_weight(FontWeight::MEDIUM)
+                            .map(|d| {
+                                if component.disabled {
+                                    d.opacity(0.5)
+                                } else {
+                                    d.cursor_pointer().hover(|s| s.opacity(0.85))
+                                }
+                            })
+                            .children(glyph)
+                            .children(component.label.clone())
+                            .when(is_link, |d| d.child(icon(IconName::ExternalLink, 13., fg)))
+                            .on_click(move |_, _, cx| {
+                                if pressed.disabled {
+                                    return;
+                                }
+                                match &pressed.url {
+                                    Some(url) if is_link => cx.open_url(url),
+                                    _ => on_press(&pressed, None, cx),
+                                }
+                            }),
+                    );
+                }
+                component_kind::STRING_SELECT => {
+                    let mut menu = v_flex().gap_1().child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme::text_muted())
+                            .child(component.placeholder.clone().unwrap_or_else(|| "Choose an option".into())),
+                    );
+                    let mut options = h_flex().flex_wrap().gap_1p5();
+                    for option in &component.options {
+                        let pressed = component.clone();
+                        let value = option.value.clone();
+                        let on_press = on_press.clone();
+                        options = options.child(
+                            div()
+                                .id(("component", next_key()))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(theme::border())
+                                .bg(theme::bg_input())
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme::bg_active()))
+                                .child(option.label.clone())
+                                .on_click(move |_, _, cx| on_press(&pressed, Some(value.clone()), cx)),
+                        );
+                    }
+                    menu = menu.child(options);
+                    line = line.child(menu);
+                }
+                component_kind::TEXT_DISPLAY => {
+                    line = line.child(div().child(component.content.clone().unwrap_or_default()));
+                }
+                _ => {}
+            }
+        }
+        column = column.child(line);
+    }
+    column.into_any_element()
 }

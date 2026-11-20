@@ -20,10 +20,14 @@ mod intents {
     pub const DIRECT_MESSAGE_REACTIONS: u64 = 1 << 13;
     pub const DIRECT_MESSAGE_TYPING: u64 = 1 << 14;
     pub const MESSAGE_CONTENT: u64 = 1 << 15;
+    pub const GUILD_MESSAGE_POLLS: u64 = 1 << 24;
+    pub const DIRECT_MESSAGE_POLLS: u64 = 1 << 25;
 }
 
 #[derive(Debug, Default)]
 pub struct Ready {
+    /// Needed when sending interactions on behalf of a user account.
+    pub session_id: String,
     pub user: User,
     pub guilds: Vec<Guild>,
     /// The current user's role ids, per guild.
@@ -60,6 +64,7 @@ pub enum Event {
     MembersChunk { guild_id: Id, members: Vec<Member>, presences: Vec<(Id, Status)> },
     OwnMemberUpdate { guild_id: Id, roles: Vec<Id> },
     VoiceState { user_id: Id, channel_id: Option<Id>, member: Option<Member> },
+    PollVote { channel_id: Id, message_id: Id, user_id: Id, answer_id: u32, added: bool },
 }
 
 #[derive(Debug)]
@@ -110,6 +115,8 @@ pub async fn run(
             | DIRECT_MESSAGES
             | DIRECT_MESSAGE_REACTIONS
             | DIRECT_MESSAGE_TYPING
+            | GUILD_MESSAGE_POLLS
+            | DIRECT_MESSAGE_POLLS
             | MESSAGE_CONTENT,
         seq: None,
         session: None,
@@ -384,7 +391,9 @@ fn dispatch(state: &mut State, kind: &str, mut d: Value) -> Vec<Event> {
             if let (Some(id), Some(url)) = (d["session_id"].as_str(), d["resume_gateway_url"].as_str()) {
                 state.session = Some(Session { id: id.to_string(), resume_url: url.to_string() });
             }
-            let ready = parse_ready(d);
+            let session_id = d["session_id"].as_str().unwrap_or_default().to_string();
+            let mut ready = parse_ready(d);
+            ready.session_id = session_id;
             state.user_id = ready.user.id;
             vec![Event::Ready(Box::new(ready))]
         }
@@ -460,6 +469,15 @@ fn dispatch(state: &mut State, kind: &str, mut d: Value) -> Vec<Event> {
             (Some(channel_id), Some(message_id)) => vec![Event::MessageAck { channel_id, message_id }],
             _ => vec![],
         },
+        "MESSAGE_POLL_VOTE_ADD" | "MESSAGE_POLL_VOTE_REMOVE" => {
+            let (Some(channel_id), Some(message_id), Some(user_id)) =
+                (id_of(&d["channel_id"]), id_of(&d["message_id"]), id_of(&d["user_id"]))
+            else {
+                return vec![];
+            };
+            let answer_id = d["answer_id"].as_u64().unwrap_or(0) as u32;
+            vec![Event::PollVote { channel_id, message_id, user_id, answer_id, added: kind == "MESSAGE_POLL_VOTE_ADD" }]
+        }
         "VOICE_STATE_UPDATE" => {
             let Some(user_id) = id_of(&d["user_id"]) else { return vec![] };
             let channel_id = id_of(&d["channel_id"]);
@@ -546,6 +564,7 @@ pub fn parse_ready(mut d: Value) -> Ready {
     };
 
     Ready {
+        session_id: String::new(),
         user,
         guilds,
         own_roles,

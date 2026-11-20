@@ -153,6 +153,8 @@ pub struct Store {
     /// Users connected to each voice channel.
     pub voice: HashMap<Id, Vec<Id>>,
     pub my_status: Status,
+    gateway_session: String,
+    forums_loaded: std::collections::HashSet<Id>,
 
     /// `None` is the direct-messages view.
     pub selected_guild: Option<Id>,
@@ -209,6 +211,8 @@ impl Store {
             show_members: true,
             voice: HashMap::new(),
             my_status: Status::Online,
+            gateway_session: String::new(),
+            forums_loaded: Default::default(),
             selected_guild: None,
             selected_channel: None,
             last_channel: HashMap::new(),
@@ -557,7 +561,8 @@ impl Store {
 
     pub fn select_channel(&mut self, channel: Id, cx: &mut Context<Self>) {
         let Some(info) = self.channels.get(&channel) else { return };
-        if !info.is_text_like() {
+        let is_forum = info.is_forum();
+        if !info.is_text_like() && !is_forum {
             return;
         }
         let guild = info.guild_id;
@@ -566,7 +571,9 @@ impl Store {
         self.last_channel.insert(guild, channel);
         cx.emit(StoreEvent::Selection);
 
-        if !self.messages.get(&channel).is_some_and(|m| m.loaded) {
+        if is_forum {
+            self.load_forum(channel, cx);
+        } else if !self.messages.get(&channel).is_some_and(|m| m.loaded) {
             self.load_history(channel, cx);
         }
         self.mark_read(channel, cx);
@@ -614,6 +621,171 @@ impl Store {
                 store.upsert_channel(channel, cx);
                 store.select_channel(id, cx);
             }
+        });
+    }
+
+    // ---------------------------------------------------------------- threads and forums
+
+    fn load_forum(&mut self, forum: Id, cx: &mut Context<Self>) {
+        if !self.forums_loaded.insert(forum) {
+            return;
+        }
+        let Some(rest) = self.rest.clone() else { return };
+        let guild = self.channels.get(&forum).and_then(|c| c.guild_id);
+        self.run(cx, async move { rest.forum_threads(forum).await }, move |store, result, cx| {
+            // Archived posts are a bonus; a failure here should not nag the user.
+            for mut thread in result.unwrap_or_default() {
+                thread.guild_id = thread.guild_id.or(guild);
+                thread.parent_id = thread.parent_id.or(Some(forum));
+                if !store.channels.contains_key(&thread.id) {
+                    store.upsert_channel(thread, cx);
+                }
+            }
+        });
+    }
+
+    /// Posts of a forum, most recently active first.
+    pub fn forum_posts(&self, forum: Id) -> Vec<&Channel> {
+        let mut posts: Vec<&Channel> =
+            self.channels.values().filter(|c| c.parent_id == Some(forum) && c.is_thread()).collect();
+        posts.sort_by_key(|c| std::cmp::Reverse(c.last_message_id.unwrap_or(c.id)));
+        posts
+    }
+
+    fn adopt_thread(&mut self, mut thread: Channel, parent: Id, cx: &mut Context<Self>) {
+        let id = thread.id;
+        thread.guild_id = thread.guild_id.or_else(|| self.channels.get(&parent).and_then(|c| c.guild_id));
+        thread.parent_id = thread.parent_id.or(Some(parent));
+        self.upsert_channel(thread, cx);
+        self.select_channel(id, cx);
+    }
+
+    fn demo_thread(&mut self, parent: Id, name: String, cx: &mut Context<Self>) -> Id {
+        let id = Id::now();
+        let thread = Channel {
+            id,
+            kind: channel_kind::PUBLIC_THREAD,
+            name: Some(name),
+            owner_id: Some(self.my_id()),
+            ..Default::default()
+        };
+        self.messages.insert(id, ChannelMessages { loaded: true, reached_start: true, ..Default::default() });
+        self.adopt_thread(thread, parent, cx);
+        id
+    }
+
+    pub fn create_thread(&mut self, channel: Id, message: Id, name: String, cx: &mut Context<Self>) {
+        if self.demo {
+            self.demo_thread(channel, name, cx);
+            return;
+        }
+        let Some(rest) = self.rest.clone() else { return };
+        self.run(cx, async move { rest.create_thread(channel, message, &name).await }, move |store, result, cx| {
+            if let Some(thread) = store.report(result, "Could not create thread", cx) {
+                store.adopt_thread(thread, channel, cx);
+            }
+        });
+    }
+
+    pub fn create_post(&mut self, forum: Id, title: String, content: String, cx: &mut Context<Self>) {
+        if self.demo {
+            let thread = self.demo_thread(forum, title, cx);
+            self.send_message(thread, content, None, Vec::new(), cx);
+            return;
+        }
+        let Some(rest) = self.rest.clone() else { return };
+        self.run(cx, async move { rest.create_post(forum, &title, &content).await }, move |store, result, cx| {
+            if let Some(thread) = store.report(result, "Could not create post", cx) {
+                store.adopt_thread(thread, forum, cx);
+            }
+        });
+    }
+
+    // ---------------------------------------------------------------- polls and interactions
+
+    pub fn vote_poll(&mut self, channel: Id, message: Id, answer: u32, cx: &mut Context<Self>) {
+        let Some(poll) = self
+            .messages
+            .get(&channel)
+            .and_then(|e| e.list.iter().find(|m| m.m.id == message))
+            .and_then(|m| m.m.poll.clone())
+        else {
+            return;
+        };
+        let (_, voted) = poll.count(answer);
+        if self.demo {
+            self.modify_message(channel, message, cx, |m| {
+                if let Some(poll) = m.poll.as_mut() {
+                    if !poll.allow_multiselect && !voted {
+                        for other in poll.answers.clone() {
+                            if poll.count(other.answer_id).1 {
+                                poll.apply_vote(other.answer_id, false, true);
+                            }
+                        }
+                    }
+                    poll.apply_vote(answer, !voted, true);
+                }
+            });
+            return;
+        }
+        let Some(rest) = self.rest.clone() else { return };
+        if rest.is_bot() {
+            cx.emit(StoreEvent::Error("Bots cannot vote in polls.".into()));
+            return;
+        }
+        let mut mine: Vec<u32> =
+            poll.answers.iter().map(|a| a.answer_id).filter(|a| poll.count(*a).1 && *a != answer).collect();
+        if !poll.allow_multiselect {
+            mine.clear();
+        }
+        if !voted {
+            mine.push(answer);
+        }
+        self.run(cx, async move { rest.vote_poll(channel, message, &mine).await }, |store, result, cx| {
+            store.report(result, "Could not vote", cx);
+        });
+    }
+
+    /// Presses a button or picks a select-menu option on a bot's message.
+    pub fn interact(
+        &mut self,
+        channel: Id,
+        message: Id,
+        custom_id: String,
+        component_type: u8,
+        value: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rest) = self.rest.clone().filter(|_| !self.demo) else {
+            cx.emit(StoreEvent::Error("Interactions are not available in demo mode.".into()));
+            return;
+        };
+        if rest.is_bot() {
+            cx.emit(StoreEvent::Error("Bots cannot use other bots' buttons.".into()));
+            return;
+        }
+        let Some(msg) = self.messages.get(&channel).and_then(|e| e.list.iter().find(|m| m.m.id == message)) else {
+            return;
+        };
+        let guild = self.channels.get(&channel).and_then(|c| c.guild_id);
+        let mut data = serde_json::json!({ "component_type": component_type, "custom_id": custom_id });
+        if let Some(value) = value {
+            data["type"] = component_type.into();
+            data["values"] = serde_json::json!([value]);
+        }
+        let payload = serde_json::json!({
+            "type": 3,
+            "nonce": Id::now().to_string(),
+            "guild_id": guild.map(|g| g.to_string()),
+            "channel_id": channel.to_string(),
+            "message_flags": msg.m.flags,
+            "message_id": message.to_string(),
+            "application_id": msg.m.application_id.unwrap_or(msg.m.author.id).to_string(),
+            "session_id": self.gateway_session,
+            "data": data,
+        });
+        self.run(cx, async move { rest.interact(payload).await }, |store, result, cx| {
+            store.report(result, "The interaction failed", cx);
         });
     }
 
@@ -1039,6 +1211,10 @@ impl Store {
         let mut threads: HashMap<Id, Vec<Id>> = HashMap::new();
         for c in all.iter().filter(|c| c.is_thread()) {
             if let Some(parent) = c.parent_id {
+                // Forum posts are listed in the forum's own view, not the sidebar.
+                if self.channels.get(&parent).is_some_and(|p| p.is_forum()) {
+                    continue;
+                }
                 threads.entry(parent).or_default().push(c.id);
             }
         }
@@ -1312,6 +1488,14 @@ impl Store {
                 }
                 cx.emit(StoreEvent::Channels);
             }
+            Event::PollVote { channel_id, message_id, user_id, answer_id, added } => {
+                let mine = user_id == self.my_id();
+                self.modify_message(channel_id, message_id, cx, |m| {
+                    if let Some(poll) = m.poll.as_mut() {
+                        poll.apply_vote(answer_id, added, mine);
+                    }
+                });
+            }
             Event::Presence { user_id, status } => {
                 self.presences.insert(user_id, status);
             }
@@ -1360,6 +1544,8 @@ impl Store {
             *entry = ChannelMessages::default();
         }
 
+        self.gateway_session = ready.session_id.clone();
+        self.forums_loaded.clear();
         self.users.insert(ready.user.id, ready.user.clone());
         self.me = Some(ready.user);
         for (user, status) in ready.presences {

@@ -62,6 +62,9 @@ impl Store {
                     channel(130, 4, "Development", None, 2),
                     channel(131, 0, "gpui", Some(130), 0),
                     channel(132, 0, "async", Some(130), 1),
+                    channel(133, 15, "ideas", Some(130), 2),
+                    json!({ "id": "1331", "type": 11, "name": "Dark mode for the docs site", "parent_id": "133", "owner_id": "2", "message_count": 14, "last_message_id": "800" }),
+                    json!({ "id": "1332", "type": 11, "name": "Weekly office hours?", "parent_id": "133", "owner_id": "4", "message_count": 5, "last_message_id": "600" }),
                 ])),
                 guild(200, "Game Night", json!([
                     channel(210, 0, "lobby", None, 0),
@@ -152,13 +155,37 @@ impl Store {
                 "attachments": [{ "id": "9001", "filename": "architecture-notes.pdf", "size": 482133, "url": "https://example.com/architecture-notes.pdf" }]
             })),
             msg(&people[4], 11, "Small text follows.\n-# last updated this morning", none()),
+            msg(&people[0], 9, "", json!({
+                "poll": {
+                    "question": { "text": "Which day works for the release?" },
+                    "answers": [
+                        { "answer_id": 1, "poll_media": { "text": "Tuesday" } },
+                        { "answer_id": 2, "poll_media": { "text": "Thursday" } },
+                        { "answer_id": 3, "poll_media": { "text": "Next week" } },
+                    ],
+                    "results": { "answer_counts": [
+                        { "id": 1, "count": 4, "me_voted": false },
+                        { "id": 2, "count": 7, "me_voted": true },
+                    ]},
+                }
+            })),
+            msg(&people[1], 7, "", json!({
+                "message_snapshots": [{ "message": { "content": "Heads up: the staging server restarts at **18:00 UTC**." } }]
+            })),
+            msg(&people[3], 5, "Deployment is ready. Choose an action:", json!({
+                "components": [{ "type": 1, "components": [
+                    { "type": 2, "style": 3, "label": "Approve", "custom_id": "approve" },
+                    { "type": 2, "style": 4, "label": "Reject", "custom_id": "reject" },
+                    { "type": 2, "style": 5, "label": "View logs", "url": "https://example.com/logs" },
+                ]}]
+            })),
         ];
         for m in &batch {
             self.learn_from(m);
         }
         let list: Vec<_> = batch.into_iter().map(|m| self.make_msg(m)).collect();
         self.messages.insert(Id(121), ChannelMessages { list, loaded: true, loading: false, reached_start: true });
-        for id in [111, 112, 122, 123, 124, 131, 132, 210, 211, 310, 400, 401, 402] {
+        for id in [111, 112, 122, 123, 124, 131, 132, 1331, 1332, 210, 211, 310, 400, 401, 402] {
             self.messages.insert(Id(id), ChannelMessages { loaded: true, reached_start: true, ..Default::default() });
         }
 

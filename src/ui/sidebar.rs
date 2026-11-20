@@ -92,7 +92,12 @@ impl Sidebar {
                 );
                 continue;
             }
-            let selected = store.selected_channel == Some(id);
+            // A forum stays highlighted while one of its posts is open.
+            let selected = store.selected_channel == Some(id)
+                || store
+                    .selected_channel
+                    .and_then(|open| store.channels.get(&open))
+                    .is_some_and(|open| open.is_thread() && open.parent_id == Some(id));
             let unread = !selected && store.is_unread(id);
             let mentions = store.mentions(id);
             let is_thread = row.kind == RowKind::Thread;
