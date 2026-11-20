@@ -1,14 +1,24 @@
 use super::{theme, widgets::*};
 use crate::{
     credentials,
-    store::{Connection, Store},
+    store::{AuthStep, Connection, Store},
 };
 use gpui::{prelude::*, *};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_kit::assets::IconName;
 
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Password,
+    Token,
+}
+
 pub struct LoginView {
     store: Entity<Store>,
+    mode: Mode,
+    login: Entity<InputState>,
+    password: Entity<InputState>,
+    code: Entity<InputState>,
     token: Entity<InputState>,
     is_bot: bool,
     _subs: Vec<Subscription>,
@@ -16,19 +26,54 @@ pub struct LoginView {
 
 impl LoginView {
     pub fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let login = cx.new(|cx| InputState::new(window, cx).placeholder("Email or phone number"));
+        let password = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("Password"));
+        let code = cx.new(|cx| InputState::new(window, cx).placeholder("6-digit code"));
         let token = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("Token"));
-        let subs = vec![
-            cx.subscribe_in(&token, window, |this, _, event: &InputEvent, window, cx| {
+        let mut subs = Vec::new();
+        for input in [&login, &password, &code, &token] {
+            subs.push(cx.subscribe_in(input, window, |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { .. }) {
                     this.submit(window, cx);
                 }
-            }),
-            cx.observe(&store, |_, _, cx| cx.notify()),
-        ];
-        Self { store, token, is_bot: false, _subs: subs }
+            }));
+        }
+        let focus_code = code.clone();
+        subs.push(cx.observe_in(&store, window, move |_, store, window, cx| {
+            // Put the cursor in the code box when the second step appears.
+            if matches!(store.read(cx).auth_step, AuthStep::Code { .. }) && !focus_code.read(cx).focus_handle(cx).is_focused(window) {
+                focus_code.update(cx, |s, cx| s.focus(window, cx));
+            }
+            cx.notify();
+        }));
+        Self { store, mode: Mode::Password, login, password, code, token, is_bot: false, _subs: subs }
     }
 
-    fn submit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn value(input: &Entity<InputState>, cx: &App) -> String {
+        input.read(cx).value().trim().to_string()
+    }
+
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.mode {
+            Mode::Token => self.submit_token(cx),
+            Mode::Password => match self.store.read(cx).auth_step {
+                AuthStep::Working => {}
+                AuthStep::Code { .. } => {
+                    let code = Self::value(&self.code, cx);
+                    self.store.update(cx, |s, cx| s.submit_auth_code(code, cx));
+                }
+                AuthStep::Idle => {
+                    let login = Self::value(&self.login, cx);
+                    let password = self.password.read(cx).value().to_string();
+                    // The password is not needed after this; clear it from the screen.
+                    self.password.update(cx, |s, cx| s.set_value("", window, cx));
+                    self.store.update(cx, |s, cx| s.password_login(login, password, cx));
+                }
+            },
+        }
+    }
+
+    fn submit_token(&mut self, cx: &mut Context<Self>) {
         let token = self.token.read(cx).value().trim().trim_matches('"').to_string();
         if token.is_empty() {
             return;
@@ -38,15 +83,157 @@ impl LoginView {
         credentials::save(&token, is_bot);
         self.store.update(cx, |store, cx| store.login(token, is_bot, cx));
     }
+
+    fn primary_button(id: &'static str, label: &'static str, busy: bool) -> Stateful<Div> {
+        div()
+            .id(id)
+            .h(px(36.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .bg(theme::accent())
+            .text_color(theme::on_accent())
+            .font_weight(FontWeight::SEMIBOLD)
+            .when(busy, |d| d.opacity(0.6))
+            .when(!busy, |d| d.cursor_pointer().hover(|s| s.opacity(0.9)))
+            .child(label)
+    }
+
+    fn link(id: &'static str, label: impl Into<SharedString>) -> Stateful<Div> {
+        div()
+            .id(id)
+            .text_size(px(13.))
+            .text_color(theme::link())
+            .cursor_pointer()
+            .hover(|s| s.underline())
+            .child(label.into())
+    }
+
+    fn tab(&self, id: &'static str, label: &'static str, mode: Mode, cx: &mut Context<Self>) -> impl IntoElement {
+        let selected = self.mode == mode;
+        div()
+            .id(id)
+            .flex_1()
+            .py_1p5()
+            .flex()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .text_size(px(13.))
+            .when(selected, |d| d.bg(theme::bg_active()).text_color(theme::text_bright()))
+            .when(!selected, |d| d.text_color(theme::text_muted()).hover(|s| s.bg(theme::bg_hover())))
+            .child(label)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.mode = mode;
+                this.store.update(cx, |s, cx| s.cancel_auth(cx));
+                cx.notify();
+            }))
+    }
+
+    fn render_password(&self, cx: &mut Context<Self>) -> Div {
+        let step = self.store.read(cx).auth_step.clone();
+        match step {
+            AuthStep::Code { texted_to, totp, sms, .. } => {
+                let prompt = match &texted_to {
+                    Some(phone) => format!("Enter the code Discord texted to {phone}."),
+                    None => "Enter the 6-digit code from your authenticator app, or an 8-digit backup code.".into(),
+                };
+                v_flex()
+                    .gap_3()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme::text_bright()).child("Two-factor authentication"))
+                    .child(div().text_size(px(13.)).text_color(theme::text_muted()).child(prompt))
+                    .child(Input::new(&self.code))
+                    .child(
+                        Self::primary_button("verify", "Verify", false)
+                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_4()
+                            .child(Self::link("auth-back", "Back").on_click(cx.listener(|this, _, _, cx| {
+                                this.store.update(cx, |s, cx| s.cancel_auth(cx));
+                            })))
+                            .when(totp && sms && texted_to.is_none(), |d| {
+                                d.child(Self::link("auth-sms", "Text me a code instead").on_click(cx.listener(
+                                    |this, _, _, cx| this.store.update(cx, |s, cx| s.text_auth_code(cx)),
+                                )))
+                            }),
+                    )
+            }
+            step => {
+                let busy = step == AuthStep::Working;
+                v_flex()
+                    .gap_3()
+                    .child(Input::new(&self.login))
+                    .child(Input::new(&self.password).mask_toggle())
+                    .child(
+                        Self::primary_button("login-password", if busy { "Logging in\u{2026}" } else { "Log in" }, busy)
+                            .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                    )
+            }
+        }
+    }
+
+    fn render_token(&self, cx: &mut Context<Self>) -> Div {
+        let is_bot = self.is_bot;
+        v_flex()
+            .gap_3()
+            .child(Input::new(&self.token).mask_toggle())
+            .child(
+                h_flex()
+                    .id("bot-toggle")
+                    .gap_2()
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .size(px(18.))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(if is_bot { theme::accent() } else { theme::text_muted() })
+                            .when(is_bot, |d| d.bg(theme::accent()))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(is_bot, |d| d.child(icon(IconName::Check, 13., theme::on_accent()))),
+                    )
+                    .child("This is a bot token")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.is_bot = !this.is_bot;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Self::primary_button("login-token", "Log in", false)
+                    .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+            )
+    }
 }
 
 impl Render for LoginView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let error = match &self.store.read(cx).connection {
-            Connection::Failed(reason) => Some(reason.clone()),
+        let store = self.store.read(cx);
+        let error = match (&store.connection, &store.auth_error) {
+            (_, Some(auth)) if self.mode == Mode::Password => Some(auth.clone()),
+            (Connection::Failed(reason), _) => Some(reason.clone()),
             _ => None,
         };
-        let is_bot = self.is_bot;
+        let body = match self.mode {
+            Mode::Password => self.render_password(cx),
+            Mode::Token => self.render_token(cx),
+        };
+        let note = match self.mode {
+            Mode::Password => {
+                "Your password goes only to Discord and is never saved; Ferrocord keeps the session \
+                 token in your operating system's credential store. Using a personal account with a \
+                 third-party client is against Discord's terms of service."
+            }
+            Mode::Token => {
+                "The token is stored in your operating system's credential store. Using a personal \
+                 account token with a third-party client is against Discord's terms of service; a bot \
+                 token is the sanctioned option."
+            }
+        };
 
         div().size_full().flex().items_center().justify_center().bg(theme::bg_rail()).child(
             v_flex()
@@ -60,43 +247,19 @@ impl Render for LoginView {
                 .child(
                     v_flex()
                         .gap_1()
-                        .child(
-                            div()
-                                .text_size(px(24.))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(theme::text_bright())
-                                .child("Ferrocord"),
-                        )
-                        .child(
-                            div()
-                                .text_color(theme::text_muted())
-                                .child("A fast, native Discord client. Sign in with a token."),
-                        ),
+                        .child(div().text_size(px(24.)).font_weight(FontWeight::BOLD).text_color(theme::text_bright()).child("Ferrocord"))
+                        .child(div().text_color(theme::text_muted()).child("A fast, native Discord client.")),
                 )
-                .child(Input::new(&self.token).mask_toggle())
                 .child(
                     h_flex()
-                        .id("bot-toggle")
-                        .gap_2()
-                        .cursor_pointer()
-                        .child(
-                            div()
-                                .size(px(18.))
-                                .rounded_sm()
-                                .border_1()
-                                .border_color(if is_bot { theme::accent() } else { theme::text_muted() })
-                                .when(is_bot, |d| d.bg(theme::accent()))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .when(is_bot, |d| d.child(icon(IconName::Check, 13., theme::on_accent()))),
-                        )
-                        .child("This is a bot token")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.is_bot = !this.is_bot;
-                            cx.notify();
-                        })),
+                        .p_1()
+                        .gap_1()
+                        .rounded_lg()
+                        .bg(theme::bg_input())
+                        .child(self.tab("mode-password", "Email and password", Mode::Password, cx))
+                        .child(self.tab("mode-token", "Token", Mode::Token, cx)),
                 )
+                .child(body)
                 .when_some(error, |d, error| {
                     d.child(
                         h_flex()
@@ -107,29 +270,7 @@ impl Render for LoginView {
                             .child(div().flex_1().min_w_0().child(error)),
                     )
                 })
-                .child(
-                    div()
-                        .id("login")
-                        .h(px(36.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .bg(theme::accent())
-                        .text_color(theme::on_accent())
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .hover(|s| s.opacity(0.9))
-                        .child("Log in")
-                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
-                )
-                .child(
-                    div().text_size(px(12.)).text_color(theme::text_muted()).child(
-                        "The token is stored in your operating system's credential store. \
-                         Using a personal account token with a third-party client is against \
-                         Discord's terms of service; a bot token is the sanctioned option.",
-                    ),
-                ),
+                .child(div().text_size(px(12.)).text_color(theme::text_muted()).child(note)),
         )
     }
 }

@@ -223,6 +223,9 @@ pub struct Store {
     pub events: HashMap<Id, Vec<ScheduledEvent>>,
     /// Events the user marked as interested.
     pub interested: std::collections::HashSet<Id>,
+    /// Progress of an email-and-password sign-in, and its latest error.
+    pub auth_step: AuthStep,
+    pub auth_error: Option<String>,
     /// About-me text and pronouns, fetched when settings open (user accounts).
     pub my_profile: Option<Profile>,
     gateway_session: String,
@@ -250,6 +253,24 @@ pub struct AuditLog {
     pub entries: Vec<discord::audit::AuditEntry>,
     /// Users the log mentions, for naming targets.
     pub users: HashMap<Id, User>,
+}
+
+/// Where an email-and-password sign-in has got to.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum AuthStep {
+    #[default]
+    Idle,
+    /// Waiting for Discord.
+    Working,
+    /// Discord wants a second factor.
+    Code {
+        ticket: String,
+        /// The masked phone number a code was texted to, when using SMS.
+        texted_to: Option<String>,
+        /// Whether an authenticator code is accepted (and SMS can be offered).
+        totp: bool,
+        sms: bool,
+    },
 }
 
 #[derive(Clone, Default, Debug, PartialEq)]
@@ -313,6 +334,8 @@ impl Store {
             stages: HashMap::new(),
             my_status: Status::Online,
             my_profile: None,
+            auth_step: AuthStep::Idle,
+            auth_error: None,
             events: HashMap::new(),
             interested: Default::default(),
             gateway_session: String::new(),
@@ -331,6 +354,110 @@ impl Store {
     }
 
     // ---------------------------------------------------------------- session
+
+    // ------------------------------------------------------- password sign-in
+
+    fn auth_failed(&mut self, error: impl Into<String>, cx: &mut Context<Self>) {
+        if !matches!(self.auth_step, AuthStep::Code { .. }) {
+            self.auth_step = AuthStep::Idle;
+        }
+        self.auth_error = Some(error.into());
+        cx.notify();
+    }
+
+    /// Finishes a sign-in: the token is kept, the password never was.
+    fn auth_succeeded(&mut self, token: String, cx: &mut Context<Self>) {
+        self.auth_step = AuthStep::Idle;
+        self.auth_error = None;
+        crate::credentials::save(&token, false);
+        self.login(token, false, cx);
+    }
+
+    /// Signs in with an email address or phone number and a password.
+    pub fn password_login(&mut self, login: String, password: String, cx: &mut Context<Self>) {
+        if login.is_empty() || password.is_empty() {
+            return self.auth_failed("Enter your email or phone number and your password.", cx);
+        }
+        let auth = match discord::auth::Auth::new() {
+            Ok(auth) => auth,
+            Err(e) => return self.auth_failed(e.to_string(), cx),
+        };
+        self.auth_step = AuthStep::Working;
+        self.auth_error = None;
+        cx.notify();
+        self.run(
+            cx,
+            async move {
+                let outcome = auth.login(&login, &password).await?;
+                // With only SMS available, text the code straight away.
+                let texted = match &outcome {
+                    discord::auth::Outcome::Mfa(mfa) if mfa.sms && !mfa.totp => Some(auth.send_sms(&mfa.ticket).await?),
+                    _ => None,
+                };
+                Ok((outcome, texted))
+            },
+            |store, result, cx| match result {
+                Ok((discord::auth::Outcome::Token(token), _)) => store.auth_succeeded(token, cx),
+                Ok((discord::auth::Outcome::Mfa(mfa), texted_to)) => {
+                    if !mfa.totp && !mfa.sms {
+                        let why = if mfa.webauthn { "a security key or passkey" } else { "a method Ferrocord does not support" };
+                        return store.auth_failed(
+                            format!("Your account's two-factor login uses {why}. Sign in with a token instead."),
+                            cx,
+                        );
+                    }
+                    store.auth_step =
+                        AuthStep::Code { ticket: mfa.ticket, texted_to, totp: mfa.totp, sms: mfa.sms };
+                    store.auth_error = None;
+                    cx.notify();
+                }
+                Err(e) => store.auth_failed(e.to_string(), cx),
+            },
+        );
+    }
+
+    /// Sends the two-factor code: an authenticator or backup code, or the texted code.
+    pub fn submit_auth_code(&mut self, code: String, cx: &mut Context<Self>) {
+        let AuthStep::Code { ticket, texted_to, .. } = self.auth_step.clone() else { return };
+        let code: String = code.chars().filter(|c| !c.is_whitespace() && *c != '-').collect();
+        if code.is_empty() {
+            return;
+        }
+        let Ok(auth) = discord::auth::Auth::new() else { return };
+        self.auth_error = None;
+        cx.notify();
+        let by_sms = texted_to.is_some();
+        self.run(
+            cx,
+            async move { if by_sms { auth.sms(&ticket, &code).await } else { auth.totp(&ticket, &code).await } },
+            |store, result, cx| match result {
+                Ok(token) => store.auth_succeeded(token, cx),
+                Err(e) => store.auth_failed(e.to_string(), cx),
+            },
+        );
+    }
+
+    /// Switches the second step to a texted code.
+    pub fn text_auth_code(&mut self, cx: &mut Context<Self>) {
+        let AuthStep::Code { ticket, totp, sms, .. } = self.auth_step.clone() else { return };
+        let Ok(auth) = discord::auth::Auth::new() else { return };
+        self.run(cx, async move { auth.send_sms(&ticket).await }, move |store, result, cx| match result {
+            Ok(phone) => {
+                if let AuthStep::Code { ticket, .. } = store.auth_step.clone() {
+                    store.auth_step = AuthStep::Code { ticket, texted_to: Some(phone), totp, sms };
+                    store.auth_error = None;
+                    cx.notify();
+                }
+            }
+            Err(e) => store.auth_failed(e.to_string(), cx),
+        });
+    }
+
+    pub fn cancel_auth(&mut self, cx: &mut Context<Self>) {
+        self.auth_step = AuthStep::Idle;
+        self.auth_error = None;
+        cx.notify();
+    }
 
     pub fn login(&mut self, token: String, is_bot: bool, cx: &mut Context<Self>) {
         self.shutdown();

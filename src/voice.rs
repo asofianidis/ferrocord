@@ -9,7 +9,7 @@ use cpal::{
     FromSample, Sample, SizedSample,
     traits::{DeviceTrait, HostTrait, StreamTrait},
 };
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use songbird::{
     Config, ConnectionInfo, CoreEvent, Driver, Event as SongbirdEvent, EventContext, EventHandler,
     driver::{Channels, DecodeConfig, DecodeMode, SampleRate},
@@ -35,6 +35,14 @@ const GATE_HANGOVER: Duration = Duration::from_millis(400);
 const SPEAKING_HOLD: Duration = Duration::from_millis(300);
 /// Received frames quieter than this (RMS of i16 samples) are not "speaking".
 const SPEAKING_RMS: f32 = 300.0;
+/// How long the microphone fades in or out when the voice gate opens or closes.
+/// Switching instantly would cut the waveform mid-swing, which clicks.
+const GATE_FADE: Duration = Duration::from_millis(10);
+/// How long after the gate closes songbird stops sending. Long enough for the
+/// faded-out audio still buffered to go out first.
+const MUTE_DELAY: Duration = Duration::from_millis(150);
+/// Length of the fade applied around playback underruns, in samples.
+const UNDERRUN_FADE: usize = 96;
 
 #[derive(Debug, Clone)]
 pub enum VoiceEvent {
@@ -98,22 +106,51 @@ pub fn db_to_linear(db: f32) -> f32 {
 /// A FIFO that waits for a little audio before playing, so that bursty
 /// producers do not cause constant underruns, and that sheds old audio when
 /// it falls too far behind.
+///
+/// Running dry fades the last samples out, and starting again fades in, so
+/// an underrun is a short dip rather than a click. Drift between the
+/// producer's and consumer's clocks is corrected only while the audio is
+/// quiet, where adding or dropping a little silence cannot be heard.
 pub struct Jitter {
     buf: VecDeque<f32>,
     primed: bool,
     prebuffer: usize,
     max: usize,
+    fade: usize,
+    /// Samples of fade-in still to apply after (re)starting.
+    fading_in: usize,
 }
 
 impl Jitter {
     pub fn new(prebuffer: usize, max: usize) -> Self {
-        Self { buf: VecDeque::with_capacity(max), primed: false, prebuffer, max }
+        Self { buf: VecDeque::with_capacity(max), primed: false, prebuffer, max, fade: 0, fading_in: 0 }
+    }
+
+    /// Fades over `samples` around underruns.
+    pub fn with_fade(mut self, samples: usize) -> Self {
+        self.fade = samples;
+        self
+    }
+
+    /// Adds audio. `quiet` audio may be dropped, or padded with extra silence,
+    /// to steer the backlog back towards the prebuffer level.
+    pub fn push_steered(&mut self, samples: &[f32], quiet: bool) {
+        if quiet && self.primed {
+            if self.buf.len() > self.prebuffer * 2 {
+                return; // Running behind: skip some silence.
+            }
+            if self.buf.len() < self.prebuffer / 2 {
+                // Running dry: add a little extra silence.
+                self.buf.extend(std::iter::repeat_n(0.0, samples.len()));
+            }
+        }
+        self.push(samples);
     }
 
     pub fn push(&mut self, samples: &[f32]) {
         self.buf.extend(samples.iter().copied());
         if self.buf.len() > self.max {
-            // Fell behind: keep only the newest prebuffer's worth.
+            // Badly behind: keep only the newest prebuffer's worth.
             let excess = self.buf.len() - self.prebuffer;
             self.buf.drain(..excess);
         }
@@ -122,22 +159,106 @@ impl Jitter {
     /// Fills `out` completely, with silence where there is no audio.
     pub fn pull(&mut self, out: &mut [f32]) {
         if !self.primed {
-            if self.buf.len() < self.prebuffer {
+            if self.buf.len() < self.prebuffer || self.buf.is_empty() {
                 out.fill(0.0);
                 return;
             }
             self.primed = true;
+            self.fading_in = self.fade;
         }
         let n = out.len().min(self.buf.len());
         for (slot, sample) in out.iter_mut().zip(self.buf.drain(..n)) {
             *slot = sample;
         }
+        let mut i = 0;
+        while self.fading_in > 0 && i < n {
+            *out.get_mut(i).unwrap() *= 1.0 - self.fading_in as f32 / (self.fade + 1) as f32;
+            self.fading_in -= 1;
+            i += 1;
+        }
         if n < out.len() {
+            // Underrun: ease the last real samples down to silence.
+            let k = n.min(self.fade);
+            for j in 0..k {
+                out[n - k + j] *= (k - j) as f32 / (k + 1) as f32;
+            }
             out[n..].fill(0.0);
             self.primed = false;
         }
     }
 
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+}
+
+/// The microphone's buffer between the capture device and songbird.
+///
+/// Songbird reads through symphonia, which asks for large blocks (up to
+/// 170 ms) at a time. Handing back only the audio that is really there,
+/// minus a small reserve, keeps it from being padded with silence.
+pub struct MicBuffer {
+    buf: VecDeque<f32>,
+    primed: bool,
+    /// Audio gathered before the first read, and the level drift is steered to.
+    target: usize,
+    /// Kept back between reads to ride out uneven capture callbacks.
+    reserve: usize,
+    /// Hard limit; beyond it the oldest audio is dropped.
+    max: usize,
+}
+
+impl MicBuffer {
+    pub fn new(rate: u32) -> Self {
+        let ms = |n: usize| rate as usize * n / 1000;
+        Self { buf: VecDeque::new(), primed: false, target: ms(40), reserve: ms(20), max: ms(1000) }
+    }
+
+    pub fn push(&mut self, samples: &[f32], quiet: bool) {
+        // The device runs ahead of songbird: drop some silence to catch up.
+        if quiet && self.buf.len() > self.target * 3 {
+            return;
+        }
+        self.buf.extend(samples.iter().copied());
+        if self.buf.len() > self.max {
+            let excess = self.buf.len() - self.target;
+            self.buf.drain(..excess);
+        }
+    }
+
+    /// Whether a read would have to dig into the reserve.
+    pub fn low(&self) -> bool {
+        !self.primed || self.buf.len() <= self.reserve
+    }
+
+    /// Moves up to `want` samples into `out`, keeping the reserve when it can.
+    /// Adds nothing if there is no audio to give.
+    pub fn take(&mut self, want: usize, out: &mut Vec<f32>) {
+        if !self.primed {
+            if self.buf.len() < self.target {
+                return;
+            }
+            self.primed = true;
+        }
+        let spare = self.buf.len().saturating_sub(self.reserve);
+        let n = if spare > 0 { want.min(spare) } else { want.min(self.buf.len()) };
+        out.extend(self.buf.drain(..n));
+        if self.buf.is_empty() {
+            self.primed = false;
+        }
+    }
+
+    /// Brings the backlog back to the target level. Only for when nobody can
+    /// hear the result, because it skips or repeats nothing smoothly.
+    pub fn rebalance(&mut self) {
+        if self.buf.len() > self.target * 2 {
+            let excess = self.buf.len() - self.target;
+            self.buf.drain(..excess);
+        }
+    }
+
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.buf.len()
     }
@@ -185,7 +306,9 @@ impl StereoResampler {
 
 struct Shared {
     /// Mono microphone samples at the input device's rate.
-    mic: Mutex<Jitter>,
+    mic: Mutex<MicBuffer>,
+    /// Signalled whenever the microphone delivers audio.
+    mic_ready: Condvar,
     /// Interleaved stereo at the output device's rate.
     out: Mutex<Jitter>,
     resampler: Mutex<StereoResampler>,
@@ -216,25 +339,79 @@ impl Shared {
     }
 }
 
-/// Serves microphone audio to songbird as an endless raw f32 stream. Reads
-/// never block: songbird's mixer thread calls this every tick.
+/// Serves microphone audio to songbird as an endless raw f32 stream.
+///
+/// Reads return only the audio that has been captured, so short reads are
+/// normal. Songbird's mixer thread makes these reads, so they wait at most a
+/// few milliseconds; if the microphone has fallen silent, a little silence
+/// is returned instead. The voice gate is applied here as a gain that fades
+/// rather than switching instantly.
 struct MicSource {
     shared: Arc<Shared>,
     pending: VecDeque<u8>,
     scratch: Vec<f32>,
+    /// Current gate gain, 0 (closed) to 1 (open).
+    gain: f32,
+    /// Gain change per sample while fading.
+    gain_step: f32,
+    /// Samples of silence to return when there is nothing to send (10 ms).
+    silence: usize,
+}
+
+impl MicSource {
+    fn new(shared: Arc<Shared>, rate: u32) -> Self {
+        let fade_samples = (rate as f32 * GATE_FADE.as_secs_f32()).max(1.0);
+        Self {
+            shared,
+            pending: VecDeque::new(),
+            scratch: Vec::new(),
+            gain: 0.0,
+            gain_step: 1.0 / fade_samples,
+            silence: (rate as usize / 100).max(1),
+        }
+    }
+
+    fn refill(&mut self, want: usize) {
+        let open = self.shared.transmitting();
+        self.scratch.clear();
+        {
+            let mut mic = self.shared.mic.lock();
+            if !open && self.gain == 0.0 {
+                // Nobody hears us right now, so drift can be corrected freely.
+                mic.rebalance();
+            }
+            if mic.low() {
+                self.shared.mic_ready.wait_for(&mut mic, Duration::from_millis(5));
+            }
+            mic.take(want, &mut self.scratch);
+        }
+        if self.scratch.is_empty() {
+            self.scratch.resize(want.min(self.silence), 0.0);
+        }
+        let target = if open { 1.0 } else { 0.0 };
+        for sample in &mut self.scratch {
+            if self.gain < target {
+                self.gain = (self.gain + self.gain_step).min(1.0);
+            } else if self.gain > target {
+                self.gain = (self.gain - self.gain_step).max(0.0);
+            }
+            *sample *= self.gain;
+        }
+        for s in &self.scratch {
+            self.pending.extend(s.to_le_bytes());
+        }
+    }
 }
 
 impl Read for MicSource {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.pending.len() < buf.len() {
-            let samples = (buf.len() - self.pending.len()).div_ceil(4);
-            self.scratch.resize(samples, 0.0);
-            self.shared.mic.lock().pull(&mut self.scratch);
-            for s in &self.scratch {
-                self.pending.extend(s.to_le_bytes());
-            }
+        if buf.is_empty() {
+            return Ok(0);
         }
-        let len = buf.len();
+        if self.pending.is_empty() {
+            self.refill(buf.len().div_ceil(4));
+        }
+        let len = buf.len().min(self.pending.len());
         for (slot, byte) in buf.iter_mut().zip(self.pending.drain(..len)) {
             *slot = byte;
         }
@@ -276,6 +453,7 @@ impl EventHandler for Receiver {
                 let deaf = shared.deafened.load(Ordering::Relaxed);
                 let mut mix = vec![0f32; (VOICE_RATE as usize / 50) * 2];
                 let now = Instant::now();
+                let mut quiet = true;
                 for (ssrc, data) in &tick.speaking {
                     let Some(pcm) = &data.decoded_voice else { continue };
                     let energy = pcm.iter().map(|s| (*s as f32).powi(2)).sum::<f32>() / pcm.len().max(1) as f32;
@@ -283,6 +461,7 @@ impl EventHandler for Receiver {
                         shared.heard.lock().insert(*ssrc, now);
                     }
                     if !deaf {
+                        quiet = false;
                         for (slot, s) in mix.iter_mut().zip(pcm) {
                             *slot += *s as f32 / 32768.0;
                         }
@@ -293,7 +472,7 @@ impl EventHandler for Receiver {
                 }
                 let mut resampled = Vec::with_capacity(mix.len() + 16);
                 shared.resampler.lock().process(&mix, &mut resampled);
-                shared.out.lock().push(&resampled);
+                shared.out.lock().push_steered(&resampled, quiet);
             }
             EventContext::DriverConnect(_) | EventContext::DriverReconnect(_) => {
                 let _ = shared.events.try_send(VoiceEvent::Connected);
@@ -350,10 +529,12 @@ fn open_input(shared: Arc<Shared>, wanted: Option<&str>) -> Result<(cpal::Stream
                     frame.iter().map(|s| f32::from_sample(*s)).sum::<f32>() / frame.len() as f32
                 }));
                 let rms = (mono.iter().map(|s| s * s).sum::<f32>() / mono.len().max(1) as f32).sqrt();
-                if rms >= shared.threshold() {
+                let loud = rms >= shared.threshold();
+                if loud {
                     *shared.last_loud.lock() = Some(Instant::now());
                 }
-                shared.mic.lock().push(&mono);
+                shared.mic.lock().push(&mono, !loud);
+                shared.mic_ready.notify_one();
             },
             |e| log::warn!("microphone stream error: {e}"),
             None,
@@ -455,8 +636,9 @@ impl VoiceConnection {
         events: async_channel::Sender<VoiceEvent>,
     ) -> Self {
         let shared = Arc::new(Shared {
-            // Microphone: wait for 40 ms of audio, keep at most 300 ms (at up to 48 kHz mono).
-            mic: Mutex::new(Jitter::new(VOICE_RATE as usize / 25, VOICE_RATE as usize * 3 / 10)),
+            // Resized for the real device rate once the microphone opens.
+            mic: Mutex::new(MicBuffer::new(VOICE_RATE)),
+            mic_ready: Condvar::new(),
             out: Mutex::new(Jitter::new(0, 0)),
             resampler: Mutex::new(StereoResampler::new(VOICE_RATE, VOICE_RATE)),
             muted: AtomicBool::new(muted),
@@ -473,7 +655,7 @@ impl VoiceConnection {
             Ok((stream, rate)) => {
                 // 60 ms of prebuffer, at most 400 ms of backlog, stereo.
                 let per_ms = rate as usize * 2 / 1000;
-                *shared.out.lock() = Jitter::new(per_ms * 60, per_ms * 400);
+                *shared.out.lock() = Jitter::new(per_ms * 60, per_ms * 400).with_fade(UNDERRUN_FADE);
                 *shared.resampler.lock() = StereoResampler::new(VOICE_RATE, rate);
                 Some(stream)
             }
@@ -504,8 +686,9 @@ impl VoiceConnection {
 
         let input = match open_input(shared.clone(), options.input_device.as_deref()) {
             Ok((stream, rate)) => {
+                *shared.mic.lock() = MicBuffer::new(rate);
                 shared.has_mic.store(true, Ordering::Relaxed);
-                let source = MicSource { shared: shared.clone(), pending: VecDeque::new(), scratch: Vec::new() };
+                let source = MicSource::new(shared.clone(), rate);
                 let input: Input = RawAdapter::new(source, rate, 1).into();
                 let _guard = runtime.enter();
                 driver.play_input(input);
@@ -584,13 +767,23 @@ impl EventHandler for ReceiverRef {
 async fn pump(driver: Arc<tokio::sync::Mutex<Driver>>, shared: Arc<Shared>, self_id: Id) {
     let mut interval = tokio::time::interval(Duration::from_millis(20));
     let mut sending = false;
+    let mut closed_at: Option<Instant> = None;
     let mut last_reported: HashSet<Id> = HashSet::new();
     loop {
         interval.tick().await;
         let transmit = shared.transmitting();
-        if transmit != sending {
-            sending = transmit;
-            driver.lock().await.mute(!transmit);
+        // Unmute as soon as the gate opens (the microphone fades in), but mute
+        // only once the fade-out has been sent, so speech never stops mid-wave.
+        let send = if transmit {
+            closed_at = None;
+            true
+        } else {
+            let since = *closed_at.get_or_insert_with(Instant::now);
+            sending && since.elapsed() < MUTE_DELAY
+        };
+        if send != sending {
+            sending = send;
+            driver.lock().await.mute(!send);
         }
 
         let mut speaking: HashSet<Id> = {
@@ -631,6 +824,55 @@ mod tests {
     }
 
     #[test]
+    fn jitter_fades_around_underruns() {
+        let mut j = Jitter::new(4, 100).with_fade(2);
+        j.push(&[1.0; 6]);
+        let mut out = [0.0f32; 4];
+        j.pull(&mut out);
+        assert!(out[0] < out[1] && out[1] < 1.0 && out[2] == 1.0, "fades in: {out:?}");
+        j.pull(&mut out);
+        assert!(out[0] > out[1] && out[1] > 0.0 && out[2] == 0.0, "fades out at underrun: {out:?}");
+    }
+
+    #[test]
+    fn jitter_steers_only_during_silence() {
+        let mut j = Jitter::new(4, 100);
+        j.push(&[1.0; 4]);
+        let mut out = [0.0f32; 1];
+        j.pull(&mut out); // primed
+        j.push_steered(&[0.5; 8], false);
+        assert_eq!(j.len(), 11, "speech is never dropped");
+        j.push_steered(&[0.0; 8], true);
+        assert_eq!(j.len(), 11, "silence is skipped while running behind");
+    }
+
+    #[test]
+    fn mic_buffer_keeps_a_reserve() {
+        let mut m = MicBuffer::new(1000); // 1 sample per ms: target 40, reserve 20
+        let mut out = Vec::new();
+        m.push(&[0.1; 30], false);
+        m.take(100, &mut out);
+        assert!(out.is_empty(), "waits for the target level first");
+        m.push(&[0.1; 30], false);
+        m.take(100, &mut out);
+        assert_eq!((out.len(), m.len()), (40, 20), "keeps the reserve");
+        out.clear();
+        m.take(100, &mut out);
+        assert_eq!(out.len(), 20, "digs into the reserve rather than send nothing");
+        assert!(m.low());
+    }
+
+    #[test]
+    fn mic_buffer_drops_silence_when_behind() {
+        let mut m = MicBuffer::new(1000);
+        m.push(&[0.1; 130], false);
+        m.push(&[0.0; 10], true);
+        assert_eq!(m.len(), 130, "quiet audio skipped while far behind");
+        m.push(&[0.1; 10], false);
+        assert_eq!(m.len(), 140, "speech kept");
+    }
+
+    #[test]
     fn jitter_sheds_backlog() {
         let mut j = Jitter::new(2, 6);
         j.push(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
@@ -663,32 +905,59 @@ mod tests {
         assert_eq!(out, input);
     }
 
-    #[test]
-    fn mic_source_always_fills_reads() {
+    fn test_shared(loud: bool) -> Arc<Shared> {
         let (tx, _rx) = async_channel::unbounded();
-        let shared = Arc::new(Shared {
-            mic: Mutex::new(Jitter::new(0, 1000)),
+        Arc::new(Shared {
+            mic: Mutex::new(MicBuffer::new(1000)),
+            mic_ready: Condvar::new(),
             out: Mutex::new(Jitter::new(0, 0)),
             resampler: Mutex::new(StereoResampler::new(1, 1)),
             muted: AtomicBool::new(false),
             deafened: AtomicBool::new(false),
             threshold: AtomicU32::new(0f32.to_bits()),
-            last_loud: Mutex::new(None),
+            last_loud: Mutex::new(loud.then(Instant::now)),
             has_mic: AtomicBool::new(true),
             ssrc_users: Mutex::new(HashMap::new()),
             heard: Mutex::new(HashMap::new()),
             events: tx,
-        });
-        shared.mic.lock().push(&[0.25, -0.5]);
-        let mut source = MicSource { shared, pending: VecDeque::new(), scratch: Vec::new() };
-        let mut buf = [0u8; 6];
-        assert_eq!(source.read(&mut buf).unwrap(), 6);
-        assert_eq!(f32::from_le_bytes(buf[..4].try_into().unwrap()), 0.25);
-        let mut rest = [0u8; 6];
-        assert_eq!(source.read(&mut rest).unwrap(), 6);
-        // The odd bytes carried over complete the second sample.
-        let second = [buf[4], buf[5], rest[0], rest[1]];
-        assert_eq!(f32::from_le_bytes(second), -0.5);
+        })
+    }
+
+    fn read_samples(source: &mut MicSource, bytes: usize) -> Vec<f32> {
+        let mut buf = vec![0u8; bytes];
+        let n = source.read(&mut buf).unwrap();
+        assert!(n > 0, "reads never signal the end of the stream");
+        buf[..n - n % 4].chunks(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    }
+
+    #[test]
+    fn mic_source_never_pads_real_audio_with_silence() {
+        let shared = test_shared(true);
+        shared.mic.lock().push(&[0.5; 60], false);
+        let mut source = MicSource::new(shared.clone(), 1000);
+        // A huge read, like symphonia's 32 KB blocks, gets only real audio.
+        let got = read_samples(&mut source, 32 * 1024);
+        assert_eq!(got.len(), 40, "only what is there, minus the reserve");
+        assert!(got.iter().skip(10).all(|s| *s == 0.5), "fully open after the fade-in");
+        assert!(got[0] < got[5] && got[5] < 0.5, "the gate fades in");
+    }
+
+    #[test]
+    fn mic_source_fades_out_when_the_gate_closes() {
+        let shared = test_shared(true);
+        shared.mic.lock().push(&[0.5; 100], false);
+        let mut source = MicSource::new(shared.clone(), 1000);
+        read_samples(&mut source, 20 * 4);
+        *shared.last_loud.lock() = None;
+        let got = read_samples(&mut source, 20 * 4);
+        assert!(got[0] > 0.0 && got[0] < 0.5 && got[12] == 0.0, "fades out: {got:?}");
+    }
+
+    #[test]
+    fn mic_source_returns_silence_without_audio() {
+        let mut source = MicSource::new(test_shared(false), 1000);
+        let got = read_samples(&mut source, 4096);
+        assert_eq!(got, vec![0.0; 10], "10 ms of silence");
     }
 
     #[test]
