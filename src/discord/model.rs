@@ -318,6 +318,15 @@ pub struct Guild {
     pub member_count: u32,
     #[serde(default, deserialize_with = "de_null")]
     pub unavailable: bool,
+    #[serde(default, deserialize_with = "de_null")]
+    pub voice_states: Vec<VoiceState>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct VoiceState {
+    pub user_id: Id,
+    #[serde(default)]
+    pub channel_id: Option<Id>,
 }
 
 impl Guild {
@@ -588,6 +597,25 @@ impl Status {
             "idle" => Status::Idle,
             "dnd" => Status::Dnd,
             _ => Status::Offline,
+        }
+    }
+
+    /// The value sent when setting our own presence.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::Online => "online",
+            Status::Idle => "idle",
+            Status::Dnd => "dnd",
+            Status::Offline => "invisible",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Status::Online => "Online",
+            Status::Idle => "Idle",
+            Status::Dnd => "Do Not Disturb",
+            Status::Offline => "Invisible",
         }
     }
 }

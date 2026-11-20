@@ -127,6 +127,7 @@ impl Store {
             first,
             msg(&people[1], 60 * 26 - 2, "Yes! It only lays out what is visible, so *thousands* of messages cost nothing.", json!({ "type": 19, "referenced_message": first_json })),
             msg(&people[1], 60 * 26 - 3, "Scrolling stays at 120 fps here.", none()),
+            msg(&people[2], 181, "Pinned: the style guide lives in <#112>.", json!({ "pinned": true })),
             msg(&people[2], 180, "# Release checklist\n- bump the version\n- run `cargo test`\n- tag and push\n> Reminder: ||the secret launch date|| is not public yet.", none()),
             msg(&people[2], 179, "```rust\nfn main() {\n    println!(\"hello, {}!\", \"world\");\n}\n```", none()),
             msg(&people[3], 120, "CI finished for <#131>: all checks passed.", json!({
@@ -184,6 +185,7 @@ impl Store {
             vec![TypingUser { user: Id(3), name: "linus (kernel)".into(), at: Instant::now() + Duration::from_secs(3600) }],
         );
 
+        self.voice.insert(Id(124), vec![Id(2), Id(3)]);
         self.select_channel(Id(121), cx);
         cx.emit(StoreEvent::Members(Id(100)));
         cx.emit(StoreEvent::Messages { channel: Id(121), change: MessageChange::Reset });

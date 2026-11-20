@@ -95,7 +95,7 @@ pub fn bot_tag() -> impl IntoElement {
         .px(px(4.))
         .rounded_sm()
         .bg(theme::accent())
-        .text_color(theme::bg_rail())
+        .text_color(theme::on_accent())
         .text_size(px(10.))
         .font_weight(FontWeight::BOLD)
         .child("APP")

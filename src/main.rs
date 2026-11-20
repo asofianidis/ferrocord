@@ -2,13 +2,14 @@
 
 mod credentials;
 mod discord;
+mod emoji;
 mod http;
 mod markdown;
+mod settings;
 mod store;
 mod ui;
 
 use gpui::{prelude::*, *};
-use gpui_component::{Theme, ThemeMode};
 use std::sync::Arc;
 
 fn main() {
@@ -28,7 +29,10 @@ fn main() {
         .with_http_client(http_client)
         .run(move |cx: &mut App| {
             gpui_kit::init(cx);
-            Theme::change(ThemeMode::Dark, None, cx);
+            let saved = settings::Settings::load();
+            let themes = ui::theme::load_all(settings::themes_dir().as_deref());
+            let palette = themes.iter().find(|t| t.id == saved.theme).unwrap_or(&themes[0]);
+            ui::theme::apply(palette, cx);
 
             let store = cx.new(|_| store::Store::new(handle.clone()));
             if std::env::args().any(|arg| arg.starts_with("--demo")) {
@@ -48,7 +52,8 @@ fn main() {
                 gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| ui::AppView::new(store, window, cx)))
                     .expect("failed to open the main window");
 
-            // Registered globally so the shortcut works wherever focus is.
+            let settings_view = view.clone();
+            // Registered globally so the shortcuts work wherever focus is.
             cx.bind_keys([
                 KeyBinding::new("ctrl-k", ui::ToggleSwitcher, None),
                 #[cfg(target_os = "macos")]
@@ -63,8 +68,20 @@ fn main() {
                     });
                 });
             });
+            cx.bind_keys([KeyBinding::new("ctrl-,", ui::ToggleSettings, None)]);
+            cx.on_action(move |_: &ui::ToggleSettings, cx| {
+                let view = settings_view.clone();
+                cx.defer(move |cx| {
+                    let _ = window.update(cx, |_, window, cx| {
+                        view.update(cx, |view, cx| view.toggle_settings(window, cx));
+                    });
+                });
+            });
             if std::env::args().any(|arg| arg == "--demo-switcher") {
                 cx.dispatch_action(&ui::ToggleSwitcher);
+            }
+            if std::env::args().any(|arg| arg == "--demo-settings") {
+                cx.dispatch_action(&ui::ToggleSettings);
             }
             cx.activate(true);
             cx.on_window_closed(|cx, _| {

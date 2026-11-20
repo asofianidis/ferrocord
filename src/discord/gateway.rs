@@ -12,6 +12,7 @@ const DEFAULT_GATEWAY: &str = "wss://gateway.discord.gg";
 
 mod intents {
     pub const GUILDS: u64 = 1 << 0;
+    pub const GUILD_VOICE_STATES: u64 = 1 << 7;
     pub const GUILD_MESSAGES: u64 = 1 << 9;
     pub const GUILD_MESSAGE_REACTIONS: u64 = 1 << 10;
     pub const GUILD_MESSAGE_TYPING: u64 = 1 << 11;
@@ -58,12 +59,14 @@ pub enum Event {
     MemberList(Value),
     MembersChunk { guild_id: Id, members: Vec<Member>, presences: Vec<(Id, Status)> },
     OwnMemberUpdate { guild_id: Id, roles: Vec<Id> },
+    VoiceState { user_id: Id, channel_id: Option<Id>, member: Option<Member> },
 }
 
 #[derive(Debug)]
 pub enum Command {
     /// Ask the gateway for the member list of a guild channel.
     SubscribeMembers { guild_id: Id, channel_id: Id },
+    SetStatus(Status),
     Shutdown,
 }
 
@@ -100,6 +103,7 @@ pub async fn run(
         token,
         is_bot,
         intents: GUILDS
+            | GUILD_VOICE_STATES
             | GUILD_MESSAGES
             | GUILD_MESSAGE_REACTIONS
             | GUILD_MESSAGE_TYPING
@@ -217,6 +221,14 @@ async fn connect(
                     None | Some(Command::Shutdown) => {
                         let _ = ws.close(None).await;
                         return Outcome::Shutdown;
+                    }
+                    Some(Command::SetStatus(status)) => {
+                        let payload = json!({ "op": 3, "d": {
+                            "since": null, "activities": [], "status": status.as_str(), "afk": false
+                        }});
+                        if let Err(e) = ws.send(WsMessage::text(payload.to_string())).await {
+                            return reconnect(format!("send failed: {e}"));
+                        }
                     }
                     Some(Command::SubscribeMembers { guild_id, channel_id }) => {
                         let payload = if state.is_bot {
@@ -448,6 +460,12 @@ fn dispatch(state: &mut State, kind: &str, mut d: Value) -> Vec<Event> {
             (Some(channel_id), Some(message_id)) => vec![Event::MessageAck { channel_id, message_id }],
             _ => vec![],
         },
+        "VOICE_STATE_UPDATE" => {
+            let Some(user_id) = id_of(&d["user_id"]) else { return vec![] };
+            let channel_id = id_of(&d["channel_id"]);
+            let member = serde_json::from_value(d["member"].take()).ok();
+            vec![Event::VoiceState { user_id, channel_id, member }]
+        }
         "GUILD_MEMBER_LIST_UPDATE" => vec![Event::MemberList(d)],
         "GUILD_MEMBERS_CHUNK" => {
             let Some(guild_id) = id_of(&d["guild_id"]) else { return vec![] };

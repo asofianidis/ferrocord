@@ -2,11 +2,11 @@
 
 use super::{theme, widgets::*};
 use crate::{
-    credentials,
     discord::{Id, channel_kind},
     store::{ChannelRow, RowKind, Store, StoreEvent},
 };
 use gpui::{prelude::*, *};
+use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::assets::IconName;
 use std::ops::Range;
 
@@ -38,6 +38,27 @@ impl Sidebar {
         let mut out = Vec::with_capacity(range.len());
         for row in self.rows.get(range).unwrap_or_default() {
             let id = row.id;
+            if row.kind == RowKind::VoiceUser {
+                let guild = store.selected_guild;
+                let (name, url) = match store.users.get(&id) {
+                    Some(user) => (store.display_name(guild, user), user.avatar_url(64)),
+                    None => ("Unknown user".to_string(), String::new()),
+                };
+                out.push(
+                    h_flex()
+                        .w_full()
+                        .h(px(32.))
+                        .pl(px(42.))
+                        .pr_2()
+                        .gap_2()
+                        .text_size(px(13.))
+                        .text_color(theme::text_muted())
+                        .child(avatar(url, 20.))
+                        .child(div().flex_1().min_w_0().truncate().child(name))
+                        .into_any_element(),
+                );
+                continue;
+            }
             let Some(channel) = store.channels.get(&id) else {
                 out.push(div().h(px(32.)).into_any_element());
                 continue;
@@ -117,6 +138,18 @@ impl Sidebar {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.store.update(cx, |store, cx| store.select_channel(id, cx));
                     }))
+                    .context_menu({
+                        let store = self.store.clone();
+                        move |menu, _, _| {
+                            let store = store.clone();
+                            menu.item(PopupMenuItem::new("Mark as Read").on_click(move |_, _, cx| {
+                                store.update(cx, |store, cx| store.mark_read(id, cx));
+                            }))
+                            .item(PopupMenuItem::new("Copy Channel ID").on_click(move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(id.to_string()));
+                            }))
+                        }
+                    })
                     .into_any_element(),
             );
         }
@@ -147,7 +180,7 @@ impl Sidebar {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(icon(IconName::Users, 16., theme::bg_rail()))
+                    .child(icon(IconName::Users, 16., theme::on_accent()))
                     .into_any_element(),
             };
             let subtitle = (channel.kind == channel_kind::GROUP_DM)
@@ -213,8 +246,18 @@ impl Render for Sidebar {
                     if row.kind == RowKind::Category {
                         hidden = store.collapsed.contains(&row.id);
                         rows.push(*row);
-                    } else if !hidden || store.selected_channel == Some(row.id) || store.is_unread(row.id) {
+                        continue;
+                    }
+                    let occupants = store.voice.get(&row.id);
+                    if !hidden
+                        || store.selected_channel == Some(row.id)
+                        || store.is_unread(row.id)
+                        || occupants.is_some()
+                    {
                         rows.push(*row);
+                        for user in occupants.into_iter().flatten() {
+                            rows.push(ChannelRow { id: *user, kind: RowKind::VoiceUser });
+                        }
                     }
                 }
                 self.rows = rows;
@@ -242,7 +285,7 @@ impl Render for Sidebar {
         };
 
         let me = store.me.clone();
-        let my_status = me.as_ref().map(|u| store.status_of(u.id)).unwrap_or_default();
+        let my_status = store.my_status;
 
         v_flex()
             .w(px(248.))
@@ -272,7 +315,7 @@ impl Render for Sidebar {
                         .child(avatar_with_status(
                             me.avatar_url(64),
                             32.,
-                            if my_status == Default::default() { crate::discord::Status::Online } else { my_status },
+                            my_status,
                             theme::bg_rail(),
                         ))
                         .child(
@@ -290,12 +333,9 @@ impl Render for Sidebar {
                                     div().truncate().text_size(px(12.)).text_color(theme::text_muted()).child(me.tag()),
                                 ),
                         )
-                        .child(icon_button("logout", IconName::LogOut, "Log out").on_click(cx.listener(
-                            |this, _, _, cx| {
-                                credentials::clear();
-                                this.store.update(cx, |store, cx| store.logout(cx));
-                            },
-                        ))),
+                        .child(icon_button("settings", IconName::Settings, "Settings (Ctrl+,)").on_click(
+                            |_, window, cx| window.dispatch_action(Box::new(super::ToggleSettings), cx),
+                        )),
                 )
             })
     }

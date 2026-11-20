@@ -92,7 +92,7 @@ impl Render for LoginView {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .when(is_bot, |d| d.child(icon(IconName::Check, 13., theme::bg_rail()))),
+                                .when(is_bot, |d| d.child(icon(IconName::Check, 13., theme::on_accent()))),
                         )
                         .child("This is a bot token")
                         .on_click(cx.listener(|this, _, _, cx| {

@@ -8,14 +8,14 @@ use super::{
 };
 use crate::{
     discord::{Attachment, Embed, Emoji, Id, Message, channel_kind, message_kind, rest::Upload},
-    markdown,
+    emoji, markdown,
     store::{MessageChange, Msg, Store, StoreEvent},
 };
 use chrono::{DateTime, Local};
 use gpui::{prelude::*, *};
 use gpui_component::{
     ActiveTheme as _,
-    input::{self, InputEvent, Textarea, TextareaState},
+    input::{self, Input, InputEvent, InputState, Textarea, TextareaState},
     menu::{ContextMenuExt as _, PopupMenuItem},
     message_scroller::{MessageScroller, MessageScrollerState},
 };
@@ -30,6 +30,61 @@ use std::{
 const GROUP_WINDOW_SECS: i64 = 7 * 60;
 const QUICK_REACTIONS: [&str; 6] = ["👍", "❤️", "😂", "🎉", "😮", "😢"];
 
+pub enum ChatEvent {
+    /// Show an image in the full-window viewer.
+    OpenImage(String),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PanelKind {
+    Pins,
+    Search,
+}
+
+/// The floating list of messages used for pins and search results.
+#[derive(Clone)]
+struct Panel {
+    kind: PanelKind,
+    title: String,
+    items: Vec<Rc<Msg>>,
+    loading: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PickerTarget {
+    Composer,
+    React(Id),
+}
+
+#[derive(Clone)]
+enum Visual {
+    Avatar(String),
+    Image(String),
+    Glyph(String),
+    Icon(IconName),
+}
+
+struct CompletionItem {
+    visual: Visual,
+    label: String,
+    detail: String,
+    /// What the composer shows.
+    shown: String,
+    /// What is sent to Discord in its place.
+    wire: String,
+}
+
+struct Completion {
+    /// Byte offset of the trigger character in the composer.
+    start: usize,
+    items: Vec<CompletionItem>,
+    selected: usize,
+}
+
+type Opener = Rc<dyn Fn(String, &mut App)>;
+
+impl EventEmitter<ChatEvent> for ChatView {}
+
 pub struct ChatView {
     store: Entity<Store>,
     channel: Option<Id>,
@@ -40,7 +95,15 @@ pub struct ChatView {
     uploads: Vec<PathBuf>,
     drafts: HashMap<Id, String>,
     revealed: HashSet<Id>,
-    pins: Option<Vec<Rc<Msg>>>,
+    panel: Option<Panel>,
+    search: Entity<InputState>,
+    picker: Option<PickerTarget>,
+    picker_query: Entity<InputState>,
+    completion: Option<Completion>,
+    /// Friendly text inserted by autocomplete, with what to send instead.
+    replacements: Vec<(String, String)>,
+    profile: Option<Id>,
+    flash: Option<Id>,
     last_typing: Option<Instant>,
     _subs: Vec<Subscription>,
 }
@@ -51,10 +114,22 @@ impl ChatView {
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx).auto_grow(1, 12).submit_on_enter(true).placeholder("Message")
         });
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
+        let picker_query = cx.new(|cx| InputState::new(window, cx).placeholder("Find an emoji"));
         let subs = vec![
             cx.subscribe_in(&store, window, Self::on_store_event),
             cx.subscribe_in(&composer, window, Self::on_input),
             cx.observe(&scroller, Self::on_scroll),
+            cx.subscribe_in(&search, window, |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.run_search(cx);
+                }
+            }),
+            cx.subscribe(&picker_query, |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            }),
         ];
         let mut this = Self {
             store,
@@ -66,7 +141,14 @@ impl ChatView {
             uploads: Vec::new(),
             drafts: HashMap::new(),
             revealed: HashSet::new(),
-            pins: None,
+            panel: None,
+            search,
+            picker: None,
+            picker_query,
+            completion: None,
+            replacements: Vec::new(),
+            profile: None,
+            flash: None,
             last_typing: None,
             _subs: subs,
         };
@@ -101,7 +183,11 @@ impl ChatView {
         self.reply_to = None;
         self.editing = None;
         self.uploads.clear();
-        self.pins = None;
+        self.panel = None;
+        self.picker = None;
+        self.completion = None;
+        self.replacements.clear();
+        self.profile = None;
         self.last_typing = None;
 
         let placeholder = {
@@ -212,6 +298,8 @@ impl ChatView {
             InputEvent::PressEnter { shift: false, .. } => self.submit(window, cx),
             InputEvent::Change => {
                 let Some(channel) = self.channel else { return };
+                self.completion = self.compute_completion(cx);
+                cx.notify();
                 if self.editing.is_some() || self.composer.read(cx).value().trim().is_empty() {
                     return;
                 }
@@ -227,7 +315,15 @@ impl ChatView {
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(channel) = self.channel else { return };
-        let content = self.composer.read(cx).value().trim().to_string();
+        let mut content = self.composer.read(cx).value().trim().to_string();
+        // Swap friendly names for the ids Discord expects, longest first so
+        // that "@Ann" never clobbers part of "@Annabel".
+        let mut replacements = std::mem::take(&mut self.replacements);
+        replacements.sort_by_key(|(shown, _)| std::cmp::Reverse(shown.len()));
+        for (shown, wire) in &replacements {
+            content = content.replace(shown.as_str(), wire);
+        }
+        self.completion = None;
 
         if let Some(message) = self.editing.take() {
             if !content.is_empty() {
@@ -342,7 +438,12 @@ impl ChatView {
 
     /// Returns true if there was something to cancel.
     fn cancel_modes(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.pins.take().is_some() {
+        let had_overlay = self.completion.take().is_some()
+            || self.picker.take().is_some()
+            || self.profile.take().is_some()
+            || self.panel.take().is_some();
+        if had_overlay {
+            self.composer.update(cx, |s, cx| s.focus(window, cx));
             cx.notify();
             return true;
         }
@@ -377,24 +478,495 @@ impl ChatView {
     }
 
     fn toggle_pins(&mut self, cx: &mut Context<Self>) {
-        if self.pins.take().is_some() {
+        if self.panel.as_ref().is_some_and(|p| p.kind == PanelKind::Pins) {
+            self.panel = None;
             cx.notify();
             return;
         }
         let Some(channel) = self.channel else { return };
-        self.pins = Some(Vec::new());
+        self.panel =
+            Some(Panel { kind: PanelKind::Pins, title: "Pinned Messages".into(), items: Vec::new(), loading: true });
         cx.notify();
         let this = cx.weak_entity();
         self.store.update(cx, |store, cx| {
-            store.fetch_pins(channel, cx, move |pins, cx| {
-                let _ = this.update(cx, |this, cx| {
-                    if this.channel == Some(channel) && this.pins.is_some() {
-                        this.pins = Some(pins);
-                        cx.notify();
-                    }
-                });
+            store.fetch_pins(channel, cx, move |items, cx| {
+                let _ = this.update(cx, |this, cx| this.fill_panel(channel, PanelKind::Pins, items, cx));
             });
         });
+    }
+
+    fn run_search(&mut self, cx: &mut Context<Self>) {
+        let Some(channel) = self.channel else { return };
+        let query = self.search.read(cx).value().trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        self.panel = Some(Panel {
+            kind: PanelKind::Search,
+            title: format!("Results for \u{201c}{query}\u{201d}"),
+            items: Vec::new(),
+            loading: true,
+        });
+        cx.notify();
+        let this = cx.weak_entity();
+        self.store.update(cx, |store, cx| {
+            store.search(channel, query, cx, move |items, cx| {
+                let _ = this.update(cx, |this, cx| this.fill_panel(channel, PanelKind::Search, items, cx));
+            });
+        });
+    }
+
+    fn fill_panel(&mut self, channel: Id, kind: PanelKind, items: Vec<Rc<Msg>>, cx: &mut Context<Self>) {
+        if self.channel != Some(channel) {
+            return;
+        }
+        if let Some(panel) = self.panel.as_mut().filter(|p| p.kind == kind) {
+            panel.items = items;
+            panel.loading = false;
+            cx.notify();
+        }
+    }
+
+    /// Scrolls to a message and highlights it briefly.
+    fn jump_to(&mut self, channel: Id, message: Id, cx: &mut Context<Self>) {
+        if self.channel != Some(channel) {
+            self.store.update(cx, |store, cx| store.select_channel(channel, cx));
+            return;
+        }
+        let ix = self
+            .store
+            .read(cx)
+            .messages
+            .get(&channel)
+            .and_then(|e| e.list.iter().position(|m| m.m.id == message));
+        let Some(ix) = ix else {
+            self.store.update(cx, |_, cx| {
+                cx.emit(StoreEvent::Error("That message is not loaded yet. Scroll up to load more history.".into()));
+            });
+            return;
+        };
+        self.scroller.update(cx, |s, cx| {
+            s.scroll_to_item(ix + 1, cx);
+        });
+        self.flash = Some(message);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(1600)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.flash == Some(message) {
+                    this.flash = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    // ------------------------------------------------------------ autocomplete
+
+    fn composer_focused(&self, window: &Window, cx: &App) -> bool {
+        self.composer.focus_handle(cx).is_focused(window)
+    }
+
+    fn compute_completion(&self, cx: &App) -> Option<Completion> {
+        let channel = self.channel?;
+        let state = self.composer.read(cx);
+        let text = state.value();
+        let cursor = state.cursor().min(text.len());
+        if !text.is_char_boundary(cursor) {
+            return None;
+        }
+        let before = &text[..cursor];
+        let start = before.char_indices().rev().find(|(_, c)| c.is_whitespace()).map_or(0, |(i, c)| i + c.len_utf8());
+        let mut chars = before[start..].chars();
+        let trigger = chars.next()?;
+        let query = chars.as_str();
+        let store = self.store.read(cx);
+
+        let items: Vec<CompletionItem> = match trigger {
+            '@' => store
+                .mention_candidates(channel, query, 8)
+                .into_iter()
+                .map(|(user, name)| CompletionItem {
+                    visual: Visual::Avatar(user.avatar_url(64)),
+                    detail: user.tag(),
+                    shown: format!("@{name}"),
+                    wire: format!("<@{}>", user.id),
+                    label: name,
+                })
+                .collect(),
+            '#' => store
+                .channel_candidates(channel, query, 8)
+                .into_iter()
+                .map(|(id, name)| CompletionItem {
+                    visual: Visual::Icon(IconName::Hash),
+                    detail: String::new(),
+                    shown: format!("#{name}"),
+                    wire: format!("<#{id}>"),
+                    label: name,
+                })
+                .collect(),
+            ':' if query.len() >= 2 && query.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => {
+                let needle = query.to_lowercase();
+                let guild = store.channels.get(&channel).and_then(|c| c.guild_id).and_then(|g| store.guild(g));
+                let custom = guild.into_iter().flat_map(|g| g.guild.emojis.iter()).filter_map(|e| {
+                    let (id, name) = (e.id?, e.name.clone()?);
+                    name.to_lowercase().contains(&needle).then(|| CompletionItem {
+                        visual: Visual::Image(e.image_url(64).unwrap_or_default()),
+                        label: format!(":{name}:"),
+                        detail: "Server emoji".into(),
+                        shown: format!(":{name}:"),
+                        wire: format!("<{}:{name}:{id}>", if e.animated { "a" } else { "" }),
+                    })
+                });
+                let unicode = emoji::search(&needle, 8).into_iter().map(|(name, glyph)| CompletionItem {
+                    visual: Visual::Glyph(glyph.to_string()),
+                    label: format!(":{name}:"),
+                    detail: String::new(),
+                    shown: glyph.to_string(),
+                    wire: glyph.to_string(),
+                });
+                custom.take(4).chain(unicode).take(8).collect()
+            }
+            _ => return None,
+        };
+        (!items.is_empty()).then_some(Completion { start, items, selected: 0 })
+    }
+
+    fn accept_completion(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(completion) = self.completion.take() else { return };
+        let Some(item) = completion.items.get(ix) else { return };
+        let (text, cursor) = {
+            let state = self.composer.read(cx);
+            (state.value().to_string(), state.cursor())
+        };
+        let cursor = cursor.min(text.len());
+        let start = completion.start;
+        if start > cursor || !text.is_char_boundary(start) || !text.is_char_boundary(cursor) {
+            return;
+        }
+        let updated = format!("{}{} {}", &text[..start], item.shown, &text[cursor..]);
+        let caret = start + item.shown.len() + 1;
+        if item.shown != item.wire && !self.replacements.iter().any(|(shown, _)| *shown == item.shown) {
+            self.replacements.push((item.shown.clone(), item.wire.clone()));
+        }
+        self.composer.update(cx, |s, cx| {
+            s.set_value(updated, window, cx);
+            s.set_selected_range(caret..caret, cx);
+            s.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn step_completion(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        let Some(completion) = self.completion.as_mut() else { return false };
+        let len = completion.items.len() as isize;
+        completion.selected = (completion.selected as isize + delta).rem_euclid(len) as usize;
+        cx.notify();
+        true
+    }
+
+    // ------------------------------------------------------------ emoji picker
+
+    fn open_picker(&mut self, target: PickerTarget, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picker == Some(target) {
+            self.picker = None;
+            self.composer.update(cx, |s, cx| s.focus(window, cx));
+        } else {
+            self.picker = Some(target);
+            self.picker_query.update(cx, |s, cx| {
+                s.set_value("", window, cx);
+                s.focus(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    fn pick_emoji(&mut self, emoji: Emoji, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(target), Some(channel)) = (self.picker.take(), self.channel) else { return };
+        match target {
+            PickerTarget::React(message) => {
+                self.store.update(cx, |s, cx| s.toggle_reaction(channel, message, emoji, cx));
+            }
+            PickerTarget::Composer => {
+                let name = emoji.name.clone().unwrap_or_default();
+                let text = match emoji.id {
+                    Some(id) => {
+                        let shown = format!(":{name}:");
+                        let wire = format!("<{}:{name}:{id}>", if emoji.animated { "a" } else { "" });
+                        if !self.replacements.iter().any(|(s, _)| *s == shown) {
+                            self.replacements.push((shown.clone(), wire));
+                        }
+                        format!("{shown} ")
+                    }
+                    None => name,
+                };
+                self.composer.update(cx, |s, cx| s.insert(text, window, cx));
+            }
+        }
+        self.composer.update(cx, |s, cx| s.focus(window, cx));
+        cx.notify();
+    }
+
+    fn render_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let store = self.store.read(cx);
+        let query = self.picker_query.read(cx).value().trim().trim_matches(':').to_lowercase();
+        let guild = self.channel.and_then(|c| store.channels.get(&c)).and_then(|c| c.guild_id).and_then(|g| store.guild(g));
+        let custom: Vec<Emoji> = guild
+            .into_iter()
+            .flat_map(|g| g.guild.emojis.iter())
+            .filter(|e| e.id.is_some() && e.name.as_ref().is_some_and(|n| n.to_lowercase().contains(&query)))
+            .take(60)
+            .cloned()
+            .collect();
+
+        let cell = |key: (&'static str, usize), tooltip: String| {
+            div()
+                .id(key)
+                .size(px(36.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(22.))
+                .hover(|s| s.bg(theme::bg_active()))
+                .tooltip(tip(tooltip))
+        };
+        let heading = |title: &str| {
+            div()
+                .w_full()
+                .pt_2()
+                .pb_1()
+                .text_size(px(11.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme::text_muted())
+                .child(title.to_uppercase())
+        };
+
+        let mut body = v_flex().id("picker-scroll").flex_1().min_h_0().overflow_y_scroll();
+        if !custom.is_empty() {
+            body = body.child(heading("Server emoji")).child(h_flex().flex_wrap().children(
+                custom.into_iter().enumerate().map(|(i, e)| {
+                    let name = e.name.clone().unwrap_or_default();
+                    let url = e.image_url(64).unwrap_or_default();
+                    cell(("custom-emoji", i), format!(":{name}:"))
+                        .child(img(url).size(px(26.)).object_fit(ObjectFit::Contain))
+                        .on_click(cx.listener(move |this, _, window, cx| this.pick_emoji(e.clone(), window, cx)))
+                }),
+            ));
+        }
+        let mut index = 0usize;
+        let mut any = false;
+        for (category, list) in emoji::CATEGORIES {
+            let hits: Vec<_> = list.iter().filter(|(name, _)| name.contains(&query)).collect();
+            if hits.is_empty() {
+                continue;
+            }
+            any = true;
+            body = body.child(heading(category)).child(h_flex().flex_wrap().children(hits.into_iter().map(
+                |(name, glyph)| {
+                    index += 1;
+                    cell(("emoji", index), format!(":{name}:")).child(*glyph).on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            let emoji = Emoji { name: Some(glyph.to_string()), ..Default::default() };
+                            this.pick_emoji(emoji, window, cx);
+                        },
+                    ))
+                },
+            )));
+        }
+        if !any {
+            body = body.child(div().p_2().text_color(theme::text_muted()).child("No emoji match."));
+        }
+
+        v_flex()
+            .id("picker")
+            .absolute()
+            .bottom(px(88.))
+            .right(px(16.))
+            .w(px(348.))
+            .h(px(380.))
+            .p_2()
+            .gap_1()
+            .occlude()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme::border())
+            .bg(theme::bg_sidebar())
+            .shadow_lg()
+            .child(Input::new(&self.picker_query))
+            .child(body)
+    }
+
+    fn render_completion(&self, completion: &Completion, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .id("completion")
+            .absolute()
+            .bottom(px(88.))
+            .left(px(16.))
+            .right(px(16.))
+            .p_1()
+            .occlude()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme::border())
+            .bg(theme::bg_sidebar())
+            .shadow_lg()
+            .children(completion.items.iter().enumerate().map(|(ix, item)| {
+                let visual = match &item.visual {
+                    Visual::Avatar(url) => avatar(url.clone(), 22.).into_any_element(),
+                    Visual::Image(url) => img(url.clone()).size(px(22.)).into_any_element(),
+                    Visual::Glyph(glyph) => div().w(px(22.)).text_size(px(18.)).child(glyph.clone()).into_any_element(),
+                    Visual::Icon(name) => icon(*name, 16., theme::text_muted()).into_any_element(),
+                };
+                h_flex()
+                    .id(("completion-item", ix))
+                    .h(px(32.))
+                    .px_2()
+                    .gap_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(ix == completion.selected, |d| d.bg(theme::bg_active()))
+                    .hover(|s| s.bg(theme::bg_hover()))
+                    .child(visual)
+                    .child(div().flex_shrink_0().text_color(theme::text_bright()).child(item.label.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.))
+                            .text_color(theme::text_muted())
+                            .child(item.detail.clone()),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| this.accept_completion(ix, window, cx)))
+            }))
+    }
+
+    fn render_profile(&self, user_id: Id, cx: &mut Context<Self>) -> impl IntoElement {
+        let store = self.store.read(cx);
+        let guild_id = self.channel.and_then(|c| store.channels.get(&c)).and_then(|c| c.guild_id);
+        let user = store.users.get(&user_id).cloned().unwrap_or_default();
+        let name = store.display_name(guild_id, &user);
+        let status = if user_id == store.my_id() { store.my_status } else { store.status_of(user_id) };
+        let roles: Vec<(String, u32)> = guild_id
+            .and_then(|g| Some((store.guild(g)?, store.member_info.get(&(g, user_id))?)))
+            .map(|(guild, member)| {
+                let mut roles: Vec<_> = guild.guild.roles.iter().filter(|r| member.roles.contains(&r.id)).collect();
+                roles.sort_by_key(|r| std::cmp::Reverse(r.position));
+                roles.into_iter().map(|r| (r.name.clone(), r.color)).collect()
+            })
+            .unwrap_or_default();
+        let is_me = user_id == store.my_id();
+
+        let button = |id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(id)
+                .px_3()
+                .py_1p5()
+                .rounded_md()
+                .cursor_pointer()
+                .map(|d| {
+                    if primary {
+                        d.bg(theme::accent()).text_color(theme::on_accent())
+                    } else {
+                        d.bg(theme::bg_input()).text_color(theme::text())
+                    }
+                })
+                .hover(|s| s.opacity(0.85))
+                .child(label)
+        };
+
+        div()
+            .id("profile-backdrop")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.profile = None;
+                cx.notify();
+            }))
+            .child(
+                v_flex()
+                    .id("profile")
+                    .absolute()
+                    .top(px(72.))
+                    .left(px(72.))
+                    .w(px(320.))
+                    .rounded_xl()
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(theme::border())
+                    .bg(theme::bg_sidebar())
+                    .shadow_lg()
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(div().h(px(56.)).w_full().bg(theme::accent()))
+                    .child(
+                        v_flex()
+                            .px_4()
+                            .pb_4()
+                            .gap_2()
+                            .child(div().mt(px(-36.)).child(avatar_with_status(
+                                user.avatar_url(128),
+                                72.,
+                                status,
+                                theme::bg_sidebar(),
+                            )))
+                            .child(
+                                v_flex()
+                                    .child(
+                                        h_flex()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .text_size(px(18.))
+                                                    .font_weight(FontWeight::BOLD)
+                                                    .text_color(theme::text_bright())
+                                                    .child(name),
+                                            )
+                                            .when(user.bot, |d| d.child(bot_tag())),
+                                    )
+                                    .child(div().text_color(theme::text_muted()).child(user.tag()))
+                                    .child(
+                                        div().text_size(px(12.)).text_color(theme::text_muted()).child(status.label()),
+                                    ),
+                            )
+                            .when(!roles.is_empty(), |d| {
+                                d.child(h_flex().flex_wrap().gap_1().children(roles.into_iter().map(|(role, color)| {
+                                    h_flex()
+                                        .px_2()
+                                        .py(px(2.))
+                                        .gap_1p5()
+                                        .rounded_md()
+                                        .bg(theme::bg_input())
+                                        .text_size(px(12.))
+                                        .child(div().size(px(8.)).rounded_full().bg(if color == 0 {
+                                            theme::text_muted()
+                                        } else {
+                                            theme::c(color)
+                                        }))
+                                        .child(role)
+                                })))
+                            })
+                            .child(
+                                h_flex()
+                                    .pt_1()
+                                    .gap_2()
+                                    .when(!is_me, |d| {
+                                        d.child(button("profile-message", "Message", true).on_click(cx.listener(
+                                            move |this, _, _, cx| {
+                                                this.profile = None;
+                                                this.store.update(cx, |store, cx| store.open_dm(user_id, cx));
+                                            },
+                                        )))
+                                    })
+                                    .child(button("profile-copy", "Copy User ID", false).on_click(move |_, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(user_id.to_string()));
+                                    })),
+                            ),
+                    ),
+            )
     }
 
     // ------------------------------------------------------------ rows
@@ -494,6 +1066,22 @@ impl ChatView {
         }
 
         // ---- body
+        let opener: Opener = {
+            let this = this.clone();
+            Rc::new(move |url: String, cx: &mut App| {
+                this.update(cx, |_, cx| cx.emit(ChatEvent::OpenImage(url)));
+            })
+        };
+        let author_id = m.author.id;
+        let show_profile = {
+            let this = this.clone();
+            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                this.update(cx, |this, cx| {
+                    this.profile = Some(author_id);
+                    cx.notify();
+                });
+            }
+        };
         let revealed = self.revealed.contains(&id);
         let on_reveal: Option<Reveal> = {
             let this = this.clone();
@@ -512,7 +1100,16 @@ impl ChatView {
                 h_flex()
                     .gap_2()
                     .items_baseline()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).text_color(name_color).child(name.clone()))
+                    .child(
+                        div()
+                            .id("author")
+                            .cursor_pointer()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(name_color)
+                            .hover(|s| s.underline())
+                            .child(name.clone())
+                            .on_click(show_profile.clone()),
+                    )
                     .when(m.author.bot, |d| d.child(bot_tag()))
                     .child(
                         div().text_size(px(11.)).text_color(theme::text_muted()).child(format_stamp(msg.time)),
@@ -547,7 +1144,7 @@ impl ChatView {
             );
         }
         for (i, attachment) in m.attachments.iter().enumerate() {
-            body = body.child(render_attachment(i, attachment));
+            body = body.child(render_attachment(i, attachment, opener.clone()));
         }
         for sticker in &m.sticker_items {
             body = body.child(match sticker.image_url() {
@@ -559,7 +1156,7 @@ impl ChatView {
             });
         }
         for (i, embed) in m.embeds.iter().enumerate() {
-            body = body.child(render_embed(i, embed, mono.clone()));
+            body = body.child(render_embed(i, embed, mono.clone(), opener.clone()));
         }
         if !m.reactions.is_empty() {
             body = body.child(h_flex().flex_wrap().gap_1().pt_1().children(m.reactions.iter().enumerate().map(
@@ -612,7 +1209,13 @@ impl ChatView {
                 .child(msg.time.format("%H:%M").to_string())
                 .into_any_element()
         } else {
-            div().pt(px(2.)).child(avatar(m.author.avatar_url(128), 40.)).into_any_element()
+            div()
+                .id("avatar")
+                .pt(px(2.))
+                .cursor_pointer()
+                .child(avatar(m.author.avatar_url(128), 40.))
+                .on_click(show_profile)
+                .into_any_element()
         };
 
         // ---- reply preview
@@ -629,7 +1232,15 @@ impl ChatView {
                 }
                 None => (String::new(), "Original message was deleted".to_string()),
             };
+            let target = m.referenced_message.as_ref().map(|r| r.id);
+            let this = this.clone();
             h_flex()
+                .id("reply-preview")
+                .when_some(target, |d, target| {
+                    d.cursor_pointer().hover(|s| s.text_color(theme::text())).on_click(move |_, _, cx| {
+                        this.update(cx, |this, cx| this.jump_to(channel_id, target, cx));
+                    })
+                })
                 .pl(px(52.))
                 .gap_1()
                 .text_size(px(12.))
@@ -670,13 +1281,10 @@ impl ChatView {
                     .rounded_md()
                     .cursor_pointer()
                     .hover(|s| s.bg(theme::bg_active()))
-                    .child("👍")
-                    .tooltip(tip("React"))
-                    .on_click(move |_, _, cx| {
-                        let emoji = Emoji { name: Some("👍".into()), ..Default::default() };
-                        this.update(cx, |this, cx| {
-                            this.store.update(cx, |s, cx| s.toggle_reaction(channel_id, id, emoji, cx));
-                        });
+                    .child("😀")
+                    .tooltip(tip("Add reaction"))
+                    .on_click(move |_, window, cx| {
+                        this.update(cx, |this, cx| this.open_picker(PickerTarget::React(id), window, cx));
                     })
             });
             bar = bar.child({
@@ -730,6 +1338,10 @@ impl ChatView {
                         });
                     }));
                 }
+                let entity = this.clone();
+                menu = menu.item(PopupMenuItem::new("Add Reaction\u{2026}").on_click(move |_, window, cx| {
+                    entity.update(cx, |this, cx| this.open_picker(PickerTarget::React(id), window, cx));
+                }));
                 menu = menu.separator();
                 let text = content.clone();
                 menu = menu.item(PopupMenuItem::new("Copy Text").on_click(move |_, _, cx| {
@@ -737,6 +1349,13 @@ impl ChatView {
                 }));
                 menu = menu.item(PopupMenuItem::new("Copy Message ID").on_click(move |_, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(id.to_string()));
+                }));
+                let link = format!(
+                    "https://discord.com/channels/{}/{channel_id}/{id}",
+                    guild.map_or_else(|| "@me".to_string(), |g| g.to_string())
+                );
+                menu = menu.item(PopupMenuItem::new("Copy Message Link").on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(link.clone()));
                 }));
                 let entity = this.clone();
                 menu = menu.item(
@@ -760,7 +1379,7 @@ impl ChatView {
             }
         };
 
-        let highlighted = self.reply_to == Some(id) || self.editing == Some(id);
+        let highlighted = self.reply_to == Some(id) || self.editing == Some(id) || self.flash == Some(id);
         let row = div()
             .id(("message", id.0))
             .group("message")
@@ -770,7 +1389,7 @@ impl ChatView {
             .when(!compact, |d| d.mt_3())
             .py(px(2.))
             .when(msg.mentions_me, |d| {
-                d.bg(theme::idle().opacity(0.08)).border_l_2().border_color(theme::idle())
+                d.bg(theme::warning().opacity(0.10)).border_l_2().border_color(theme::warning())
             })
             .when(highlighted, |d| d.bg(theme::accent().opacity(0.10)))
             .hover(|s| s.bg(theme::bg_hover()))
@@ -797,7 +1416,7 @@ impl ChatView {
             None => (channel_kind::TEXT, String::new(), None, false),
         };
         let members_shown = store.show_members;
-        let pins_shown = self.pins.is_some();
+        let pins_shown = self.panel.as_ref().is_some_and(|p| p.kind == PanelKind::Pins);
 
         h_flex()
             .h(px(48.))
@@ -829,6 +1448,13 @@ impl ChatView {
             })
             .when(self.channel.is_some(), |d| {
                 d.child(
+                    div().w(px(210.)).flex_shrink_0().child(
+                        Input::new(&self.search)
+                            .cleanable(true)
+                            .prefix(icon(IconName::Search, 14., theme::text_muted())),
+                    ),
+                )
+                .child(
                     icon_button("pins", IconName::Pin, "Pinned messages")
                         .when(pins_shown, |b| b.bg(theme::bg_active()))
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_pins(cx))),
@@ -845,12 +1471,19 @@ impl ChatView {
             })
     }
 
-    fn render_pins(&self, pins: &[Rc<Msg>], cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_panel(&self, panel: &Panel, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
         let guild = self.channel.and_then(|c| store.channels.get(&c)).and_then(|c| c.guild_id);
         let mono = cx.theme().mono_font_family.clone();
+        let empty = if panel.loading {
+            "Loading\u{2026}"
+        } else if panel.kind == PanelKind::Pins {
+            "This channel has no pinned messages."
+        } else {
+            "No messages found."
+        };
         v_flex()
-            .id("pins")
+            .id("panel")
             .absolute()
             .top(px(52.))
             .right(px(12.))
@@ -869,20 +1502,30 @@ impl ChatView {
                     .py_2()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::text_bright())
-                    .child("Pinned Messages"),
+                    .child(panel.title.clone()),
             )
-            .when(pins.is_empty(), |d| {
-                d.child(div().px_3().pb_3().text_color(theme::text_muted()).child("Nothing pinned, or still loading…"))
+            .when(panel.items.is_empty(), |d| {
+                d.child(div().px_3().pb_3().text_color(theme::text_muted()).child(empty))
             })
-            .children(pins.iter().enumerate().map(|(i, msg)| {
+            .children(panel.items.iter().enumerate().map(|(i, msg)| {
+                let (channel, id) = (msg.m.channel_id, msg.m.id);
+                let place = (panel.kind == PanelKind::Search)
+                    .then(|| store.channels.get(&channel).map(|c| format!("#{}", store.channel_title(c))))
+                    .flatten();
                 v_flex()
-                    .id(("pin", i))
+                    .id(("panel-item", i))
                     .mx_2()
                     .mb_2()
                     .p_2()
                     .gap_1()
                     .rounded_md()
+                    .cursor_pointer()
                     .bg(theme::bg_chat())
+                    .hover(|s| s.bg(theme::bg_hover()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.panel = None;
+                        this.jump_to(channel, id, cx);
+                    }))
                     .child(
                         h_flex()
                             .gap_2()
@@ -898,7 +1541,10 @@ impl ChatView {
                                     .text_size(px(11.))
                                     .text_color(theme::text_muted())
                                     .child(format_stamp(msg.time)),
-                            ),
+                            )
+                            .when_some(place, |d, place| {
+                                d.child(div().text_size(px(11.)).text_color(theme::text_muted()).child(place))
+                            }),
                     )
                     .children(rich::render_doc(&msg.doc, true, None, mono.clone()))
                     .when(!msg.m.attachments.is_empty(), |d| {
@@ -1032,6 +1678,24 @@ impl ChatView {
                             .child(Textarea::new(&self.composer).appearance(false).bordered(false)),
                     )
                     .child(
+                        div()
+                            .id("emoji")
+                            .size(px(28.))
+                            .flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_size(px(17.))
+                            .hover(|s| s.bg(theme::bg_active()))
+                            .child("😀")
+                            .tooltip(tip("Emoji"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_picker(PickerTarget::Composer, window, cx)
+                            })),
+                    )
+                    .child(
                         icon_button("send", IconName::Send, "Send")
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                     ),
@@ -1080,7 +1744,9 @@ impl Render for ChatView {
                 .into_any_element()
         };
 
-        let pins = self.pins.clone();
+        let panel = self.panel.clone();
+        let profile = self.profile;
+        let picker_open = self.picker.is_some();
         v_flex()
             .relative()
             .flex_1()
@@ -1094,15 +1760,40 @@ impl Render for ChatView {
                 }
             }))
             .capture_action(cx.listener(|this, _: &input::MoveUp, window, cx| {
-                if this.editing.is_none() && this.composer.read(cx).value().is_empty() {
+                if !this.composer_focused(window, cx) {
+                    return;
+                }
+                if this.step_completion(-1, cx) {
+                    cx.stop_propagation();
+                } else if this.editing.is_none() && this.composer.read(cx).value().is_empty() {
                     this.edit_last_own(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &input::MoveDown, window, cx| {
+                if this.composer_focused(window, cx) && this.step_completion(1, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &input::Enter, window, cx| {
+                if let Some(selected) = this.completion.as_ref().map(|c| c.selected) {
+                    this.accept_completion(selected, window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &input::IndentInline, window, cx| {
+                if let Some(selected) = this.completion.as_ref().map(|c| c.selected) {
+                    this.accept_completion(selected, window, cx);
                     cx.stop_propagation();
                 }
             }))
             .child(self.render_header(cx))
             .child(list)
             .child(self.render_composer(cx))
-            .when_some(pins, |d, pins| d.child(self.render_pins(&pins, cx)))
+            .when_some(self.completion.as_ref(), |d, completion| d.child(self.render_completion(completion, cx)))
+            .when(picker_open, |d| d.child(self.render_picker(cx)))
+            .when_some(panel, |d, panel| d.child(self.render_panel(&panel, cx)))
+            .when_some(profile, |d, user| d.child(self.render_profile(user, cx)))
     }
 }
 
@@ -1154,7 +1845,7 @@ fn sized_url(url: &str, w: f32, h: f32) -> String {
     format!("{url}{sep}width={}&height={}", (w * 2.) as u32, (h * 2.) as u32)
 }
 
-fn media(id: impl Into<ElementId>, src: String, open: String, w: f32, h: f32) -> impl IntoElement {
+fn media(id: impl Into<ElementId>, src: String, open: String, w: f32, h: f32, opener: Opener) -> impl IntoElement {
     div()
         .id(id)
         .w(px(w))
@@ -1179,10 +1870,10 @@ fn media(id: impl Into<ElementId>, src: String, open: String, w: f32, h: f32) ->
                         .into_any_element()
                 }),
         )
-        .on_click(move |_, _, cx| cx.open_url(&open))
+        .on_click(move |_, _, cx| opener(open.clone(), cx))
 }
 
-fn render_attachment(ix: usize, attachment: &Attachment) -> AnyElement {
+fn render_attachment(ix: usize, attachment: &Attachment, opener: Opener) -> AnyElement {
     if attachment.is_image() {
         let (w, h) = fit(attachment.width.unwrap_or(400), attachment.height.unwrap_or(300), 420., 320.);
         let base = if attachment.proxy_url.is_empty() { &attachment.url } else { &attachment.proxy_url };
@@ -1192,7 +1883,7 @@ fn render_attachment(ix: usize, attachment: &Attachment) -> AnyElement {
         } else {
             sized_url(base, w, h)
         };
-        return media(("attachment", ix), src, attachment.url.clone(), w, h).into_any_element();
+        return media(("attachment", ix), src, attachment.url.clone(), w, h, opener).into_any_element();
     }
     let url = attachment.url.clone();
     h_flex()
@@ -1223,7 +1914,7 @@ fn render_attachment(ix: usize, attachment: &Attachment) -> AnyElement {
         .into_any_element()
 }
 
-fn render_embed(ix: usize, embed: &Embed, mono: SharedString) -> AnyElement {
+fn render_embed(ix: usize, embed: &Embed, mono: SharedString, opener: Opener) -> AnyElement {
     let has_text = embed.title.is_some()
         || embed.description.is_some()
         || embed.author.is_some()
@@ -1234,8 +1925,8 @@ fn render_embed(ix: usize, embed: &Embed, mono: SharedString) -> AnyElement {
     if !has_text {
         if let Some(image) = embed.image.as_ref().or(embed.thumbnail.as_ref()) {
             let (w, h) = fit(image.width.unwrap_or(400), image.height.unwrap_or(300), 420., 320.);
-            let open = embed.url.clone().unwrap_or_else(|| image.url.clone());
-            return media(("embed", ix), sized_url(image.best_url(), w, h), open, w, h).into_any_element();
+            return media(("embed", ix), sized_url(image.best_url(), w, h), image.url.clone(), w, h, opener)
+                .into_any_element();
         }
         return div().into_any_element();
     }
@@ -1287,7 +1978,14 @@ fn render_embed(ix: usize, embed: &Embed, mono: SharedString) -> AnyElement {
     }
     if let Some(image) = &embed.image {
         let (w, h) = fit(image.width.unwrap_or(400), image.height.unwrap_or(300), 380., 300.);
-        column = column.child(media(("embed-image", ix), sized_url(image.best_url(), w, h), image.url.clone(), w, h));
+        column = column.child(media(
+            ("embed-image", ix),
+            sized_url(image.best_url(), w, h),
+            image.url.clone(),
+            w,
+            h,
+            opener.clone(),
+        ));
     }
     if let Some(footer) = &embed.footer {
         column = column.child(
@@ -1297,7 +1995,7 @@ fn render_embed(ix: usize, embed: &Embed, mono: SharedString) -> AnyElement {
 
     let thumbnail = embed.image.is_none().then_some(embed.thumbnail.as_ref()).flatten().map(|thumb| {
         let (w, h) = fit(thumb.width.unwrap_or(80), thumb.height.unwrap_or(80), 80., 80.);
-        media(("embed-thumb", ix), sized_url(thumb.best_url(), w, h), thumb.url.clone(), w, h)
+        media(("embed-thumb", ix), sized_url(thumb.best_url(), w, h), thumb.url.clone(), w, h, opener.clone())
     });
 
     h_flex()

@@ -40,6 +40,10 @@ impl Rest {
         Ok(Self { inner: Arc::new(Inner { http, auth, is_bot }) })
     }
 
+    pub fn is_bot(&self) -> bool {
+        self.inner.is_bot
+    }
+
     fn request(&self, method: Method, path: &str) -> RequestBuilder {
         self.inner
             .http
@@ -169,6 +173,25 @@ impl Rest {
         let body = json!({ "token": null });
         self.send(|| self.request(Method::POST, &path).json(&body)).await?;
         Ok(())
+    }
+
+    /// Full-text search. Only available to user accounts.
+    pub async fn search(&self, guild: Option<Id>, channel: Id, query: &str) -> Result<Vec<Message>> {
+        let scope = match guild {
+            Some(guild) => format!("/guilds/{guild}"),
+            None => format!("/channels/{channel}"),
+        };
+        let path = format!("{scope}/messages/search?content={}", percent_encode(query));
+        let body: Value = self.send(|| self.request(Method::GET, &path)).await?.json().await?;
+        let mut hits = Vec::new();
+        for group in body["messages"].as_array().into_iter().flatten() {
+            let group = group.as_array().cloned().unwrap_or_default();
+            let hit = group.iter().find(|m| m["hit"].as_bool() == Some(true)).or(group.first());
+            if let Some(m) = hit.and_then(|m| serde_json::from_value(m.clone()).ok()) {
+                hits.push(m);
+            }
+        }
+        Ok(hits)
     }
 
     pub async fn open_dm(&self, user: Id) -> Result<Channel> {

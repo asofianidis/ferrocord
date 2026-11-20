@@ -85,6 +85,8 @@ pub enum RowKind {
     Category,
     Channel,
     Thread,
+    /// Someone connected to the voice channel above; the row id is a user id.
+    VoiceUser,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -104,6 +106,7 @@ pub struct GuildState {
 pub struct MemberInfo {
     pub nick: Option<String>,
     pub color: Option<u32>,
+    pub roles: Vec<Id>,
 }
 
 #[derive(Clone, Debug)]
@@ -147,6 +150,9 @@ pub struct Store {
     pub member_lists: HashMap<Id, Vec<MemberRow>>,
     pub collapsed: std::collections::HashSet<Id>,
     pub show_members: bool,
+    /// Users connected to each voice channel.
+    pub voice: HashMap<Id, Vec<Id>>,
+    pub my_status: Status,
 
     /// `None` is the direct-messages view.
     pub selected_guild: Option<Id>,
@@ -201,6 +207,8 @@ impl Store {
             member_lists: HashMap::new(),
             collapsed: Default::default(),
             show_members: true,
+            voice: HashMap::new(),
+            my_status: Status::Online,
             selected_guild: None,
             selected_channel: None,
             last_channel: HashMap::new(),
@@ -423,7 +431,83 @@ impl Store {
         self.dms.iter().filter(|id| self.is_unread(**id)).count() as u32
     }
 
-    fn mark_read(&mut self, channel: Id, cx: &mut Context<Self>) {
+    pub fn mark_guild_read(&mut self, guild: Id, cx: &mut Context<Self>) {
+        let channels: Vec<Id> = self
+            .guild(guild)
+            .map(|g| g.rows.iter().filter(|r| r.kind != RowKind::Category).map(|r| r.id).collect())
+            .unwrap_or_default();
+        for channel in channels {
+            self.mark_read(channel, cx);
+        }
+    }
+
+    pub fn set_status(&mut self, status: Status, cx: &mut Context<Self>) {
+        self.my_status = status;
+        let me = self.my_id();
+        self.presences.insert(me, status);
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(Command::SetStatus(status));
+        }
+        cx.emit(StoreEvent::Channels);
+    }
+
+    /// Members of a channel's guild (or DM recipients) whose name matches `query`.
+    pub fn mention_candidates(&self, channel: Id, query: &str, limit: usize) -> Vec<(User, String)> {
+        let Some(info) = self.channels.get(&channel) else { return Vec::new() };
+        let query = query.to_lowercase();
+        let mut out: Vec<(u8, User, String)> = Vec::new();
+        let mut consider = |user: &User, name: String| {
+            let (a, b) = (name.to_lowercase(), user.username.to_lowercase());
+            let rank = if a.starts_with(&query) || b.starts_with(&query) {
+                0
+            } else if a.contains(&query) || b.contains(&query) {
+                1
+            } else {
+                return;
+            };
+            out.push((rank, user.clone(), name));
+        };
+        match info.guild_id {
+            Some(guild) => {
+                for ((g, user_id), member) in &self.member_info {
+                    if *g != guild {
+                        continue;
+                    }
+                    if let Some(user) = self.users.get(user_id) {
+                        consider(user, member.nick.clone().unwrap_or_else(|| user.display_name().to_string()));
+                    }
+                }
+            }
+            None => {
+                for user in info.recipients.iter().chain(self.me.as_ref()) {
+                    consider(user, user.display_name().to_string());
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.to_lowercase().cmp(&b.2.to_lowercase())));
+        out.truncate(limit);
+        out.into_iter().map(|(_, user, name)| (user, name)).collect()
+    }
+
+    /// Text channels of the same guild whose name matches `query`.
+    pub fn channel_candidates(&self, channel: Id, query: &str, limit: usize) -> Vec<(Id, String)> {
+        let Some(guild) = self.channels.get(&channel).and_then(|c| c.guild_id).and_then(|g| self.guild(g)) else {
+            return Vec::new();
+        };
+        let query = query.to_lowercase();
+        guild
+            .rows
+            .iter()
+            .filter(|r| r.kind != RowKind::Category)
+            .filter_map(|r| {
+                let name = self.channels.get(&r.id)?.name.clone()?;
+                name.to_lowercase().contains(&query).then_some((r.id, name))
+            })
+            .take(limit)
+            .collect()
+    }
+
+    pub fn mark_read(&mut self, channel: Id, cx: &mut Context<Self>) {
         let Some(last) = self.channels.get(&channel).and_then(|c| c.last_message_id) else { return };
         let marker = self.read.entry(channel).or_default();
         if marker.last_read.is_some_and(|read| read >= last) && marker.mentions == 0 {
@@ -561,7 +645,7 @@ impl Store {
                 .max_by_key(|r| r.position)
                 .map(|r| r.color)
         });
-        self.member_info.insert((guild, user.id), MemberInfo { nick: member.nick.clone(), color });
+        self.member_info.insert((guild, user.id), MemberInfo { nick: member.nick.clone(), color, roles: member.roles.clone() });
         self.users.entry(user.id).or_insert_with(|| user.clone());
     }
 
@@ -752,6 +836,10 @@ impl Store {
     }
 
     pub fn set_pinned(&mut self, channel: Id, message: Id, pinned: bool, cx: &mut Context<Self>) {
+        if self.demo {
+            self.modify_message(channel, message, cx, |m| m.pinned = pinned);
+            return;
+        }
         let Some(rest) = self.rest.clone() else { return };
         self.run(cx, async move { rest.set_pinned(channel, message, pinned).await }, |store, result, cx| {
             store.report(result, "Could not change pin", cx);
@@ -759,6 +847,23 @@ impl Store {
     }
 
     pub fn toggle_reaction(&mut self, channel: Id, message: Id, emoji: Emoji, cx: &mut Context<Self>) {
+        if self.demo {
+            self.modify_message(channel, message, cx, |m| {
+                match m.reactions.iter_mut().find(|r| r.emoji.same_as(&emoji)) {
+                    Some(r) if r.me => {
+                        r.me = false;
+                        r.count -= 1;
+                    }
+                    Some(r) => {
+                        r.me = true;
+                        r.count += 1;
+                    }
+                    None => m.reactions.push(Reaction { count: 1, me: true, emoji }),
+                }
+                m.reactions.retain(|r| r.count > 0);
+            });
+            return;
+        }
         let Some(rest) = self.rest.clone() else { return };
         let mine = self
             .messages
@@ -782,12 +887,52 @@ impl Store {
         cx: &mut Context<Self>,
         then: impl FnOnce(Vec<Rc<Msg>>, &mut gpui::App) + 'static,
     ) {
+        if self.demo {
+            let pins = self.local_messages(channel, |m| m.pinned);
+            cx.defer(move |cx| then(pins, cx));
+            return;
+        }
         let Some(rest) = self.rest.clone() else { return };
         self.run(cx, async move { rest.pins(channel).await }, move |store, result, cx| {
             if let Some(pins) = store.report(result, "Could not load pins", cx) {
                 let msgs = pins.into_iter().map(|m| store.make_msg(m)).collect();
                 then(msgs, cx);
             }
+        });
+    }
+
+    fn local_messages(&self, channel: Id, keep: impl Fn(&Message) -> bool) -> Vec<Rc<Msg>> {
+        self.messages
+            .get(&channel)
+            .map(|e| e.list.iter().rev().filter(|m| keep(&m.m)).cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Searches the channel's guild (or the DM) for `query`.
+    pub fn search(
+        &mut self,
+        channel: Id,
+        query: String,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(Vec<Rc<Msg>>, &mut gpui::App) + 'static,
+    ) {
+        if self.demo {
+            let needle = query.to_lowercase();
+            let hits = self.local_messages(channel, |m| m.content.to_lowercase().contains(&needle));
+            cx.defer(move |cx| then(hits, cx));
+            return;
+        }
+        let Some(rest) = self.rest.clone() else { return };
+        if rest.is_bot() {
+            cx.emit(StoreEvent::Error("Search is not available to bot accounts.".into()));
+            cx.defer(move |cx| then(Vec::new(), cx));
+            return;
+        }
+        let guild = self.channels.get(&channel).and_then(|c| c.guild_id);
+        self.run(cx, async move { rest.search(guild, channel, &query).await }, move |store, result, cx| {
+            let hits = store.report(result, "Search failed", cx).unwrap_or_default();
+            let msgs = hits.into_iter().map(|m| store.make_msg(m)).collect();
+            then(msgs, cx);
         });
     }
 
@@ -931,6 +1076,11 @@ impl Store {
             let mut channel = channel;
             channel.guild_id = Some(id);
             self.channels.insert(channel.id, channel);
+        }
+        for state in std::mem::take(&mut guild.voice_states) {
+            if let Some(channel) = state.channel_id {
+                self.voice.entry(channel).or_default().push(state.user_id);
+            }
         }
         let members = std::mem::take(&mut guild.members);
         match self.guild_mut(id) {
@@ -1146,6 +1296,22 @@ impl Store {
                 list.push(TypingUser { user: user_id, name, at: Instant::now() });
                 cx.emit(StoreEvent::Typing(channel_id));
             }
+            Event::VoiceState { user_id, channel_id, member } => {
+                for users in self.voice.values_mut() {
+                    users.retain(|u| *u != user_id);
+                }
+                self.voice.retain(|_, users| !users.is_empty());
+                if let Some(channel) = channel_id {
+                    self.voice.entry(channel).or_default().push(user_id);
+                    let guild = self.channels.get(&channel).and_then(|c| c.guild_id);
+                    if let (Some(guild), Some(member)) = (guild, &member) {
+                        if let Some(user) = &member.user {
+                            self.learn_member(guild, &user.clone(), member);
+                        }
+                    }
+                }
+                cx.emit(StoreEvent::Channels);
+            }
             Event::Presence { user_id, status } => {
                 self.presences.insert(user_id, status);
             }
@@ -1188,6 +1354,7 @@ impl Store {
         self.dms.clear();
         self.read.clear();
         self.member_lists.clear();
+        self.voice.clear();
         self.subscribed = None;
         for entry in self.messages.values_mut() {
             *entry = ChannelMessages::default();

@@ -6,6 +6,7 @@ use crate::{
     store::{Store, StoreEvent},
 };
 use gpui::{prelude::*, *};
+use gpui_component::menu::{ContextMenuExt as _, PopupMenuItem};
 use gpui_kit::assets::IconName;
 
 pub struct Rail {
@@ -36,7 +37,7 @@ impl Rail {
         unread: bool,
         mentions: u32,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         let pill_height = if selected {
             36.
         } else if unread {
@@ -44,7 +45,7 @@ impl Rail {
         } else {
             0.
         };
-        div()
+        let row = div()
             .id(("rail-item", key))
             .relative()
             .w_full()
@@ -71,7 +72,19 @@ impl Rail {
             .tooltip(tip(name))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.store.update(cx, |store, cx| store.select_guild(target, cx));
+            }));
+        let Some(guild) = target else { return row.into_any_element() };
+        let store = self.store.clone();
+        row.context_menu(move |menu, _, _| {
+            let store = store.clone();
+            menu.item(PopupMenuItem::new("Mark Server as Read").on_click(move |_, _, cx| {
+                store.update(cx, |store, cx| store.mark_guild_read(guild, cx));
             }))
+            .item(PopupMenuItem::new("Copy Server ID").on_click(move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(guild.to_string()));
+            }))
+        })
+        .into_any_element()
     }
 }
 
@@ -91,7 +104,7 @@ impl Render for Rail {
             .child(icon(
                 IconName::MessageCircle,
                 22.,
-                if home_selected { theme::bg_rail() } else { theme::text() },
+                if home_selected { theme::on_accent() } else { theme::text() },
             ))
             .into_any_element();
         let dm_unread = store.dm_unread();
@@ -115,7 +128,7 @@ impl Render for Rail {
         let mut items = Vec::with_capacity(entries.len() + 2);
         items.push(
             self.item(0, None, "Direct Messages".into(), home_visual, home_selected, dm_unread > 0, dm_unread, cx)
-                .into_any_element(),
+,
         );
         items.push(
             div().w(px(32.)).h(px(2.)).flex_shrink_0().rounded_full().bg(theme::bg_active()).into_any_element(),
