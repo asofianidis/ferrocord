@@ -35,6 +35,12 @@ impl Store {
                     { "id": (id + 2).to_string(), "name": "Contributors", "color": 0xe0a458, "position": 1, "permissions": "0" },
                 ],
                 "channels": channels,
+                "guild_scheduled_events": if id == 100 { json!([
+                    { "id": "8801", "guild_id": "100", "name": "Release 1.0 launch party",
+                      "description": "Celebrate the release and plan what comes next.",
+                      "scheduled_start_time": (chrono::Utc::now() + chrono::Duration::days(2)).to_rfc3339(),
+                      "status": 1, "entity_type": 2, "channel_id": "124", "user_count": 6 },
+                ]) } else { json!([]) },
                 "emojis": [
                     { "id": (id + 60).to_string(), "name": "ferris" },
                     { "id": (id + 61).to_string(), "name": "shipit" },

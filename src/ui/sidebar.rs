@@ -333,10 +333,33 @@ impl Render for Sidebar {
                 }
                 self.rows = rows;
                 let id: Id = guild.guild.id;
+                let upcoming = store.upcoming_events(id);
+                let live = upcoming.iter().any(|e| e.is_live());
+                let show_events = !upcoming.is_empty() || store.can(id, super::events::MANAGE_EVENTS);
+                let events_row = h_flex()
+                    .id("events-row")
+                    .mx_2()
+                    .mt_2()
+                    .px_2()
+                    .h(px(32.))
+                    .gap_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_color(if live { theme::online() } else { theme::text_muted() })
+                    .hover(|s| s.bg(theme::bg_hover()).text_color(theme::text_bright()))
+                    .child(icon(IconName::Calendar, 16., if live { theme::online() } else { theme::text_muted() }))
+                    .child(div().flex_1().child(if live { "Event happening now" } else { "Events" }))
+                    .when(!upcoming.is_empty(), |d| d.child(div().text_size(px(12.)).child(upcoming.len().to_string())))
+                    .on_click(move |_, _, cx| form::open_events(id, cx));
                 (
                     guild.guild.name.clone(),
-                    uniform_list(("channels", id.0), self.rows.len(), cx.processor(Self::channel_rows))
+                    v_flex()
                         .flex_1()
+                        .min_h_0()
+                        .when(show_events, |d| d.child(events_row))
+                        .child(
+                            uniform_list(("channels", id.0), self.rows.len(), cx.processor(Self::channel_rows)).flex_1(),
+                        )
                         .into_any_element(),
                 )
             }

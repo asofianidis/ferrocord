@@ -339,6 +339,8 @@ pub struct Guild {
     pub stickers: Vec<StickerItem>,
     #[serde(default, deserialize_with = "de_null")]
     pub stage_instances: Vec<StageInstance>,
+    #[serde(default, deserialize_with = "de_null")]
+    pub guild_scheduled_events: Vec<super::events::ScheduledEvent>,
 }
 
 /// A webhook: an address apps can post messages to.

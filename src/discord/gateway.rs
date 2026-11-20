@@ -92,6 +92,9 @@ pub enum Event {
     /// A server's custom emoji or stickers were replaced.
     Emojis { guild_id: Id, emojis: Vec<Emoji> },
     Stickers { guild_id: Id, stickers: Vec<StickerItem> },
+    ScheduledEvent(Box<super::events::ScheduledEvent>),
+    ScheduledEventDelete { guild_id: Id, id: Id },
+    EventInterest { event_id: Id, user_id: Id, added: bool },
 }
 
 #[derive(Debug)]
@@ -572,6 +575,21 @@ fn dispatch(state: &mut State, kind: &str, mut d: Value) -> Vec<Event> {
         "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE" => {
             let Some(guild_id) = id_of(&d["guild_id"]) else { return vec![] };
             one(parse::<Role>(d["role"].take(), kind).map(|role| Event::RoleUpsert { guild_id, role }))
+        }
+        "GUILD_SCHEDULED_EVENT_CREATE" | "GUILD_SCHEDULED_EVENT_UPDATE" => {
+            one(parse::<super::events::ScheduledEvent>(d, kind).map(|e| Event::ScheduledEvent(Box::new(e))))
+        }
+        "GUILD_SCHEDULED_EVENT_DELETE" => match (id_of(&d["guild_id"]), id_of(&d["id"])) {
+            (Some(guild_id), Some(id)) => vec![Event::ScheduledEventDelete { guild_id, id }],
+            _ => vec![],
+        },
+        "GUILD_SCHEDULED_EVENT_USER_ADD" | "GUILD_SCHEDULED_EVENT_USER_REMOVE" => {
+            match (id_of(&d["guild_scheduled_event_id"]), id_of(&d["user_id"])) {
+                (Some(event_id), Some(user_id)) => {
+                    vec![Event::EventInterest { event_id, user_id, added: kind.ends_with("ADD") }]
+                }
+                _ => vec![],
+            }
         }
         "GUILD_EMOJIS_UPDATE" => match (id_of(&d["guild_id"]), serde_json::from_value(d["emojis"].clone())) {
             (Some(guild_id), Ok(emojis)) => vec![Event::Emojis { guild_id, emojis }],

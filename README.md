@@ -48,6 +48,9 @@ The official client is an Electron app: high memory use, slow startup, and a slu
 - Channel and category permission overrides for any role or member
 - Custom emoji and stickers: upload, rename and delete
 - Webhooks: create, rename, move to another channel, copy the address and delete
+- AutoMod: keyword rules with blocking and timeouts; switch any rule on or off, or delete it
+- Onboarding: default channels, and questions whose answers give roles and channels
+- Scheduled events: browse, mark yourself interested, and create, start, end, cancel or delete them
 - Members: change nicknames, add and remove roles, time out, kick and ban, limited to what your permissions allow
 
 **App**
@@ -62,7 +65,7 @@ Discord only offers some features to user accounts: search, friends, GIF search,
 
 ### Not implemented
 
-Video, camera and screen sharing. Voice is built on songbird, which handles audio only, so video would need its own transport, codecs and DAVE frame encryption. Also not present: AutoMod, and server onboarding and events.
+Video, camera and screen sharing. Voice is built on songbird, which handles audio only, so video would need its own transport, codecs and DAVE frame encryption. 
 
 ### About voice
 

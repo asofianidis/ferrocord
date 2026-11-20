@@ -3,6 +3,7 @@
 mod call;
 mod channel_permissions;
 mod chat;
+mod events;
 pub mod form;
 mod friends;
 mod login;
@@ -45,6 +46,8 @@ pub struct AppView {
     _server_settings_sub: Option<Subscription>,
     channel_permissions: Option<Entity<channel_permissions::ChannelPermissions>>,
     _channel_permissions_sub: Option<Subscription>,
+    events: Option<Entity<events::EventsView>>,
+    _events_sub: Option<Subscription>,
     _subs: Vec<Subscription>,
 }
 
@@ -130,6 +133,8 @@ impl AppView {
             _server_settings_sub: None,
             channel_permissions: None,
             _channel_permissions_sub: None,
+            events: None,
+            _events_sub: None,
             _subs: subs,
         }
     }
@@ -165,6 +170,17 @@ impl AppView {
                 cx.notify();
             }));
         self.channel_permissions = Some(view);
+        cx.notify();
+    }
+
+    pub fn show_events(&mut self, guild: crate::discord::Id, cx: &mut Context<Self>) {
+        let view = cx.new(|cx| events::EventsView::new(self.store.clone(), guild, cx));
+        self._events_sub = Some(cx.subscribe(&view, |this, _, _: &events::EventsEvent, cx| {
+            this.events = None;
+            this._events_sub = None;
+            cx.notify();
+        }));
+        self.events = Some(view);
         cx.notify();
     }
 
@@ -285,6 +301,7 @@ impl Render for AppView {
                 if this.lightbox.take().is_some()
                     || this.form.take().is_some()
                     || this.channel_permissions.take().is_some()
+                    || this.events.take().is_some()
                     || this.server_settings.take().is_some()
                     || this.settings.take().is_some()
                 {
@@ -360,6 +377,7 @@ impl Render for AppView {
             .children(self.settings.clone())
             .children(self.server_settings.clone())
             .children(self.channel_permissions.clone())
+            .children(self.events.clone())
             .children(self.form.clone())
             .children(lightbox)
     }

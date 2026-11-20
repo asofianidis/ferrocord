@@ -1,4 +1,7 @@
-//! Server settings: overview, roles, bans and the audit log.
+//! Server settings: overview, roles, expressions, webhooks, moderation,
+//! bans and the audit log.
+
+mod moderation;
 
 use super::{form, theme, widgets::*};
 use crate::{
@@ -25,6 +28,8 @@ enum Tab {
     Emoji,
     Stickers,
     Webhooks,
+    AutoMod,
+    Onboarding,
     Bans,
     AuditLog,
 }
@@ -81,6 +86,10 @@ pub struct ServerSettings {
     bans: Option<Vec<Ban>>,
     audit: Option<AuditLog>,
     webhooks: Option<Vec<Webhook>>,
+    automod: Option<Vec<crate::discord::automod::Rule>>,
+    /// Onboarding settings as Discord sent them, with unsaved edits.
+    onboarding: Option<serde_json::Value>,
+    onboarding_dirty: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -114,6 +123,9 @@ impl ServerSettings {
             bans: None,
             audit: None,
             webhooks: None,
+            automod: None,
+            onboarding: None,
+            onboarding_dirty: false,
             _subs: subs,
         }
     }
@@ -133,6 +145,12 @@ impl ServerSettings {
 
     fn open_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
         self.tab = tab;
+        if tab == Tab::AutoMod && self.automod.is_none() && self.store.read(cx).can(self.guild, p::MANAGE_GUILD) {
+            self.load_automod(cx);
+        }
+        if tab == Tab::Onboarding && self.onboarding.is_none() && self.store.read(cx).can(self.guild, p::MANAGE_GUILD) {
+            self.load_onboarding(cx);
+        }
         if tab == Tab::Webhooks && self.webhooks.is_none() && self.store.read(cx).can(self.guild, MANAGE_WEBHOOKS) {
             let this = cx.weak_entity();
             let guild = self.guild;
@@ -920,6 +938,8 @@ impl Render for ServerSettings {
             ("Emoji", Tab::Emoji),
             ("Stickers", Tab::Stickers),
             ("Webhooks", Tab::Webhooks),
+            ("AutoMod", Tab::AutoMod),
+            ("Onboarding", Tab::Onboarding),
             ("Bans", Tab::Bans),
             ("Audit Log", Tab::AuditLog),
         ];
@@ -929,6 +949,8 @@ impl Render for ServerSettings {
             Tab::Emoji => self.render_emoji(cx),
             Tab::Stickers => self.render_stickers(cx),
             Tab::Webhooks => self.render_webhooks(cx),
+            Tab::AutoMod => self.render_automod(cx),
+            Tab::Onboarding => self.render_onboarding(cx),
             Tab::Bans => self.render_bans(cx),
             Tab::AuditLog => self.render_audit(cx),
         };
@@ -945,8 +967,8 @@ impl Render for ServerSettings {
             .child(
                 v_flex()
                     .id("server-settings")
-                    .w(px(860.))
-                    .max_h(px(640.))
+                    .w(px(900.))
+                    .h(px(640.))
                     .p_5()
                     .gap_3()
                     .rounded_xl()
@@ -968,24 +990,41 @@ impl Render for ServerSettings {
                                     .text_color(theme::text_bright())
                                     .child(name),
                             )
-                            .children(tabs.into_iter().enumerate().map(|(ix, (label, value))| {
-                                div()
-                                    .id(("server-tab", ix))
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .when(tab == value, |d| d.bg(theme::bg_active()).text_color(theme::text_bright()))
-                                    .hover(|s| s.bg(theme::bg_hover()))
-                                    .child(label)
-                                    .on_click(cx.listener(move |this, _, _, cx| this.open_tab(value, cx)))
-                            }))
                             .child(
                                 icon_button("server-settings-close", IconName::X, "Close")
                                     .on_click(cx.listener(|_, _, _, cx| cx.emit(ServerSettingsEvent::Close))),
                             ),
                     )
-                    .child(div().id("server-settings-body").flex_1().min_h_0().overflow_y_scroll().child(body)),
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_h_0()
+                            .items_start()
+                            .gap_4()
+                            .child(v_flex().w(px(130.)).flex_shrink_0().gap_0p5().children(tabs.into_iter().enumerate().map(
+                                |(ix, (label, value))| {
+                                    div()
+                                        .id(("server-tab", ix))
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .cursor_pointer()
+                                        .when(tab == value, |d| d.bg(theme::bg_active()).text_color(theme::text_bright()))
+                                        .hover(|s| s.bg(theme::bg_hover()))
+                                        .child(label)
+                                        .on_click(cx.listener(move |this, _, _, cx| this.open_tab(value, cx)))
+                                },
+                            )))
+                            .child(
+                                div()
+                                    .id("server-settings-body")
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .overflow_y_scroll()
+                                    .child(body),
+                            ),
+                    ),
             )
     }
 }

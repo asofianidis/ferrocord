@@ -6,12 +6,14 @@
 
 use crate::discord::{
     self, Ban, Channel, Emoji, Gif, Guild, Id, Member, Message, Overwrite, Reaction, Role, Status, StickerItem, User, Webhook,
+    automod::{self, Rule},
+    events::ScheduledEvent,
     VoiceState, channel_kind,
     commands::{self, SlashCommand},
     gateway::{self, Command, Event},
     proto::Folder,
     permissions,
-    rest::{Rest, Upload},
+    rest::{HttpMethod, Rest, Upload},
 };
 use crate::markdown::{self, Doc};
 use anyhow::{Result, anyhow};
@@ -217,6 +219,10 @@ pub struct Store {
     /// Live stages and their topics.
     pub stages: HashMap<Id, String>,
     pub my_status: Status,
+    /// Scheduled events per server.
+    pub events: HashMap<Id, Vec<ScheduledEvent>>,
+    /// Events the user marked as interested.
+    pub interested: std::collections::HashSet<Id>,
     /// About-me text and pronouns, fetched when settings open (user accounts).
     pub my_profile: Option<Profile>,
     gateway_session: String,
@@ -307,6 +313,8 @@ impl Store {
             stages: HashMap::new(),
             my_status: Status::Online,
             my_profile: None,
+            events: HashMap::new(),
+            interested: Default::default(),
             gateway_session: String::new(),
             relationships: Vec::new(),
             muted: crate::settings::Settings::load().muted.into_iter().map(Id).collect(),
@@ -1393,6 +1401,213 @@ impl Store {
             return apply(self, (), cx);
         }
         self.admin("Could not delete the sticker", cx, move |rest| async move { rest.delete_sticker(guild, sticker).await }, apply);
+    }
+
+    // ----------------------------------------------------------------- events
+
+    fn upsert_event(&mut self, guild: Id, event: ScheduledEvent, cx: &mut Context<Self>) {
+        let list = self.events.entry(guild).or_default();
+        match list.iter_mut().find(|e| e.id == event.id) {
+            Some(existing) => {
+                // Updates from the gateway carry no interested count.
+                let count = existing.user_count;
+                *existing = event;
+                if existing.user_count.is_none() {
+                    existing.user_count = count;
+                }
+            }
+            None => list.push(event),
+        }
+        list.sort_by_key(|e| e.start());
+        cx.emit(StoreEvent::Channels);
+        cx.notify();
+    }
+
+    /// Upcoming and running events of a server, soonest first.
+    pub fn upcoming_events(&self, guild: Id) -> Vec<ScheduledEvent> {
+        self.events.get(&guild).map(|l| l.iter().filter(|e| e.is_upcoming()).cloned().collect()).unwrap_or_default()
+    }
+
+    /// Refreshes a server's events with their interested counts.
+    pub fn refresh_events(&mut self, guild: Id, cx: &mut Context<Self>) {
+        if self.demo {
+            return;
+        }
+        let path = format!("/guilds/{guild}/scheduled-events?with_user_count=true");
+        self.admin("Could not load events", cx, move |rest| async move { rest.call(HttpMethod::GET, path, None).await }, move |store, list, cx| {
+            let events: Vec<ScheduledEvent> = serde_json::from_value(list).unwrap_or_default();
+            store.events.insert(guild, Vec::new());
+            for e in events {
+                store.upsert_event(guild, e, cx);
+            }
+        });
+    }
+
+    pub fn create_event(&mut self, guild: Id, body: serde_json::Value, cx: &mut Context<Self>) {
+        if self.demo {
+            let mut body = body;
+            body["id"] = serde_json::json!(Id::now().to_string());
+            let Ok(mut event) = serde_json::from_value::<ScheduledEvent>(body) else { return };
+            event.guild_id = Some(guild);
+            event.status = 1;
+            event.user_count = Some(1);
+            self.interested.insert(event.id);
+            return self.upsert_event(guild, event, cx);
+        }
+        let path = format!("/guilds/{guild}/scheduled-events");
+        self.admin("Could not create the event", cx, move |rest| async move { rest.call(HttpMethod::POST, path, Some(body)).await }, move |store, value, cx| {
+            if let Ok(event) = serde_json::from_value::<ScheduledEvent>(value) {
+                store.upsert_event(guild, event, cx);
+            }
+        });
+    }
+
+    /// Starts (2), ends (3) or cancels (4) an event.
+    pub fn set_event_status(&mut self, guild: Id, event: Id, status: u8, cx: &mut Context<Self>) {
+        let apply = move |store: &mut Self, cx: &mut Context<Self>| {
+            if let Some(e) = store.events.get_mut(&guild).and_then(|l| l.iter_mut().find(|e| e.id == event)) {
+                e.status = status;
+            }
+            cx.emit(StoreEvent::Channels);
+            cx.notify();
+        };
+        if self.demo {
+            return apply(self, cx);
+        }
+        let path = format!("/guilds/{guild}/scheduled-events/{event}");
+        let body = serde_json::json!({ "status": status });
+        self.admin("Could not change the event", cx, move |rest| async move { rest.call(HttpMethod::PATCH, path, Some(body)).await }, move |store, _, cx| apply(store, cx));
+    }
+
+    pub fn delete_event(&mut self, guild: Id, event: Id, cx: &mut Context<Self>) {
+        let apply = move |store: &mut Self, cx: &mut Context<Self>| store.apply(Event::ScheduledEventDelete { guild_id: guild, id: event }, cx);
+        if self.demo {
+            return apply(self, cx);
+        }
+        let path = format!("/guilds/{guild}/scheduled-events/{event}");
+        self.admin("Could not delete the event", cx, move |rest| async move { rest.call(HttpMethod::DELETE, path, None).await }, move |store, _, cx| apply(store, cx));
+    }
+
+    /// Marks or unmarks the user as interested in an event.
+    pub fn toggle_interest(&mut self, guild: Id, event: Id, cx: &mut Context<Self>) {
+        let on = !self.interested.contains(&event);
+        let apply = move |store: &mut Self, cx: &mut Context<Self>| {
+            if on {
+                store.interested.insert(event);
+            } else {
+                store.interested.remove(&event);
+            }
+            if let Some(e) = store.events.get_mut(&guild).and_then(|l| l.iter_mut().find(|e| e.id == event)) {
+                let count = e.user_count.unwrap_or(0);
+                e.user_count = Some(if on { count + 1 } else { count.saturating_sub(1) });
+            }
+            cx.emit(StoreEvent::Channels);
+            cx.notify();
+        };
+        if self.demo {
+            return apply(self, cx);
+        }
+        if self.is_bot() {
+            cx.emit(StoreEvent::Error("Bot accounts cannot mark interest in events.".into()));
+            return;
+        }
+        let path = format!("/guilds/{guild}/scheduled-events/{event}/users/@me");
+        let method = if on { HttpMethod::PUT } else { HttpMethod::DELETE };
+        self.admin("Could not update your interest", cx, move |rest| async move { rest.call(method, path, None).await }, move |store, _, cx| apply(store, cx));
+    }
+
+    // ---------------------------------------------------------------- AutoMod
+
+    pub fn fetch_automod(&mut self, guild: Id, cx: &mut Context<Self>, then: impl FnOnce(Vec<Rule>, &mut gpui::App) + 'static) {
+        if self.demo {
+            let sample = automod::parse_list(&serde_json::json!([
+                { "id": "7001", "name": "No leaked builds", "trigger_type": 1, "enabled": true,
+                  "trigger_metadata": { "keyword_filter": ["leaked build", "*.torrent"], "allow_list": [] },
+                  "actions": [{ "type": 1 }] },
+                { "id": "7002", "name": "Block mention spam", "trigger_type": 5, "enabled": true,
+                  "trigger_metadata": { "mention_total_limit": 10 }, "actions": [{ "type": 1 }] },
+            ]));
+            cx.defer(move |cx| then(sample, cx));
+            return;
+        }
+        let path = format!("/guilds/{guild}/auto-moderation/rules");
+        self.admin("Could not load AutoMod rules", cx, move |rest| async move { rest.call(HttpMethod::GET, path, None).await }, move |_, list, cx| {
+            let rules = automod::parse_list(&list);
+            cx.defer(move |cx| then(rules, cx));
+        });
+    }
+
+    /// Creates a rule (`rule` is `None`) or changes one, handing back the result.
+    pub fn save_automod_rule(
+        &mut self,
+        guild: Id,
+        rule: Option<Id>,
+        body: serde_json::Value,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(Rule, &mut gpui::App) + 'static,
+    ) {
+        if self.demo {
+            // A partial change (such as switching a rule off) is already shown by the caller.
+            if body.get("name").is_none() {
+                return;
+            }
+            let mut value = body;
+            value["id"] = serde_json::json!(rule.unwrap_or_else(Id::now).to_string());
+            value["trigger_type"] = value.get("trigger_type").cloned().unwrap_or(serde_json::json!(1));
+            value["enabled"] = value.get("enabled").cloned().unwrap_or(serde_json::json!(true));
+            if let Some(rule) = automod::parse(&value) {
+                cx.defer(move |cx| then(rule, cx));
+            }
+            return;
+        }
+        let (method, path) = match rule {
+            Some(id) => (HttpMethod::PATCH, format!("/guilds/{guild}/auto-moderation/rules/{id}")),
+            None => (HttpMethod::POST, format!("/guilds/{guild}/auto-moderation/rules")),
+        };
+        self.admin("Could not save the AutoMod rule", cx, move |rest| async move { rest.call(method, path, Some(body)).await }, move |_, value, cx| {
+            if let Some(rule) = automod::parse(&value) {
+                cx.defer(move |cx| then(rule, cx));
+            }
+        });
+    }
+
+    pub fn delete_automod_rule(&mut self, guild: Id, rule: Id, cx: &mut Context<Self>, then: impl FnOnce(&mut gpui::App) + 'static) {
+        if self.demo {
+            cx.defer(then);
+            return;
+        }
+        let path = format!("/guilds/{guild}/auto-moderation/rules/{rule}");
+        self.admin("Could not delete the rule", cx, move |rest| async move { rest.call(HttpMethod::DELETE, path, None).await }, move |_, _, cx| {
+            cx.defer(then);
+        });
+    }
+
+    // ------------------------------------------------------------- onboarding
+
+    pub fn fetch_onboarding(&mut self, guild: Id, cx: &mut Context<Self>, then: impl FnOnce(serde_json::Value, &mut gpui::App) + 'static) {
+        if self.demo {
+            let sample = serde_json::json!({ "guild_id": guild.to_string(), "enabled": false, "mode": 0,
+                "default_channel_ids": [], "prompts": [] });
+            cx.defer(move |cx| then(sample, cx));
+            return;
+        }
+        let path = format!("/guilds/{guild}/onboarding");
+        self.admin("Could not load onboarding", cx, move |rest| async move { rest.call(HttpMethod::GET, path, None).await }, move |_, value, cx| {
+            cx.defer(move |cx| then(value, cx));
+        });
+    }
+
+    pub fn save_onboarding(&mut self, guild: Id, body: serde_json::Value, cx: &mut Context<Self>, then: impl FnOnce(serde_json::Value, &mut gpui::App) + 'static) {
+        if self.demo {
+            cx.emit(StoreEvent::Notice("Onboarding saved.".into()));
+            cx.defer(move |cx| then(body, cx));
+            return;
+        }
+        let path = format!("/guilds/{guild}/onboarding");
+        self.admin("Could not save onboarding", cx, move |rest| async move { rest.call(HttpMethod::PUT, path, Some(body)).await }, move |_, value, cx| {
+            cx.emit(StoreEvent::Notice("Onboarding saved.".into()));
+            cx.defer(move |cx| then(value, cx));
+        });
     }
 
     // --------------------------------------------------------------- webhooks
@@ -2866,6 +3081,11 @@ impl Store {
             self.stages.insert(stage.channel_id, stage.topic);
         }
         let members = std::mem::take(&mut guild.members);
+        // Updates carry no events; keep what we have.
+        let events = std::mem::take(&mut guild.guild_scheduled_events);
+        if !events.is_empty() || !self.events.contains_key(&id) {
+            self.events.insert(id, events);
+        }
         match self.guild_mut(id) {
             Some(existing) => {
                 // GUILD_UPDATE carries no channels; keep what we have.
@@ -3177,6 +3397,27 @@ impl Store {
                 }
                 self.member_info.remove(&(guild_id, user_id));
                 cx.emit(StoreEvent::Members(guild_id));
+            }
+            Event::ScheduledEvent(event) => {
+                if let Some(guild) = event.guild_id {
+                    self.upsert_event(guild, *event, cx);
+                }
+            }
+            Event::ScheduledEventDelete { guild_id, id } => {
+                if let Some(list) = self.events.get_mut(&guild_id) {
+                    list.retain(|e| e.id != id);
+                }
+                cx.emit(StoreEvent::Channels);
+            }
+            Event::EventInterest { event_id, user_id, added } => {
+                if user_id == self.my_id() {
+                    if added {
+                        self.interested.insert(event_id);
+                    } else {
+                        self.interested.remove(&event_id);
+                    }
+                }
+                cx.emit(StoreEvent::Channels);
             }
             Event::Emojis { guild_id, emojis } => {
                 if let Some(state) = self.guild_mut(guild_id) {

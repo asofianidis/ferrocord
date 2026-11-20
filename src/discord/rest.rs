@@ -20,6 +20,8 @@ struct Inner {
     is_bot: bool,
 }
 
+pub use reqwest::Method as HttpMethod;
+
 pub struct Upload {
     pub filename: String,
     pub bytes: Vec<u8>,
@@ -508,6 +510,21 @@ impl Rest {
         let path = format!("/webhooks/{webhook}");
         self.send(|| self.request(Method::DELETE, &path)).await?;
         Ok(())
+    }
+
+    /// A request whose JSON reply (or empty reply, as `Null`) is handled by the caller.
+    pub async fn call(&self, method: Method, path: String, body: Option<Value>) -> Result<Value> {
+        let resp = self
+            .send(|| {
+                let req = self.request(method.clone(), &path);
+                match &body {
+                    Some(b) => req.json(b),
+                    None => req,
+                }
+            })
+            .await?;
+        let text = resp.text().await?;
+        Ok(if text.trim().is_empty() { Value::Null } else { serde_json::from_str(&text)? })
     }
 
     pub async fn audit_log(&self, guild: Id) -> Result<Value> {

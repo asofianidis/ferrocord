@@ -271,6 +271,10 @@ pub fn open_server_settings(guild: crate::discord::Id, window: &mut Window, cx: 
     with_app(cx, |app, cx| app.show_server_settings(guild, window, cx));
 }
 
+pub fn open_events(guild: crate::discord::Id, cx: &mut App) {
+    with_app(cx, |app, cx| app.show_events(guild, cx));
+}
+
 pub fn open_channel_permissions(channel: crate::discord::Id, window: &mut Window, cx: &mut App) {
     with_app(cx, |app, cx| app.show_channel_permissions(channel, window, cx));
 }
