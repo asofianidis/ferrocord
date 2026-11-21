@@ -1,6 +1,6 @@
 [package]
 name = "ferrocord"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "A fast, native Discord client written in Rust"
 
@@ -37,6 +37,7 @@ sha2 = "0.10"
 qrcode = { version = "0.14", default-features = false }
 cargo-packager-updater = "0.2"
 semver = "1"
+symphonia = { version = "0.5", default-features = false, features = ["pcm"] }
 
 [profile.dev]
 opt-level = 1

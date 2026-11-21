@@ -1055,6 +1055,10 @@ mod tests {
         assert_eq!(out, input);
     }
 
+    pub(super) fn test_shared_for(loud: bool) -> Arc<Shared> {
+        test_shared(loud)
+    }
+
     fn test_shared(loud: bool) -> Arc<Shared> {
         let (tx, _rx) = async_channel::unbounded();
         Arc::new(Shared {
@@ -1125,5 +1129,41 @@ mod tests {
     fn decibels_convert() {
         assert!((db_to_linear(0.0) - 1.0).abs() < 1e-6);
         assert!((db_to_linear(-20.0) - 0.1).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod songbird_input_tests {
+    use super::*;
+    use songbird::input::codecs::{get_codec_registry, get_probe};
+
+    /// Songbird must be able to prepare the microphone stream for playback.
+    #[test]
+    fn mic_source_prepares_in_songbird() {
+        let shared = super::tests::test_shared_for(true);
+        *shared.mic.lock() = MicBuffer::new(44_100);
+        shared.mic.lock().push(&[0.25; 44_100], false);
+        let source = MicSource::new(shared, 44_100);
+        let input: Input = RawAdapter::new(source, 44_100, 1).into();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = input.make_playable(get_codec_registry(), get_probe(), rt.handle());
+        let input = match result {
+            Ok(input) => input,
+            Err(e) => panic!("songbird could not prepare the mic stream: {e:?}"),
+        };
+        let Input::Live(songbird::input::LiveInput::Parsed(mut parsed), _) = input else {
+            panic!("the mic stream was not parsed");
+        };
+        // Pull packets the way songbird's mixer does, and check the audio
+        // that comes out is ours (after the gate's 10 ms fade-in).
+        let mut samples = Vec::new();
+        while samples.len() < 2_000 {
+            let packet = parsed.format.next_packet().expect("a packet");
+            let decoded = parsed.decoder.decode(&packet).expect("decodable");
+            let mut buf = symphonia::core::audio::SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+            buf.copy_interleaved_ref(decoded);
+            samples.extend_from_slice(buf.samples());
+        }
+        assert!(samples[1_000..2_000].iter().all(|s| (*s - 0.25).abs() < 1e-6), "real microphone audio");
     }
 }
