@@ -27,8 +27,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Release profile, so the installer build below reuses the compiled dependencies.
       - name: Test
-        run: cargo test --locked
+        run: cargo test --release --locked
 
       - name: Read version
         id: version

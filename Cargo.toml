@@ -1,6 +1,6 @@
 [package]
 name = "ferrocord"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "A fast, native Discord client written in Rust"
 
@@ -43,6 +43,10 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+[patch.crates-io]
+# Fixes decoding of DAVE-encrypted voice; see vendor/songbird/FERROCORD-PATCH.md.
+songbird = { path = "vendor/songbird" }
 
 [build-dependencies]
 winresource = "0.1"

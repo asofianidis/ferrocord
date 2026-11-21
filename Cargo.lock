@@ -2289,7 +2289,7 @@ dependencies = [
 
 [[package]]
 name = "ferrocord"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -8582,8 +8582,6 @@ dependencies = [
 [[package]]
 name = "songbird"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "371362adce10df3244fbf93475ac53391aedd425482f160a9dbb3e042577de8b"
 dependencies = [
  "aead",
  "aes-gcm",
