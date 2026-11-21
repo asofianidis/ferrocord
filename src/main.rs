@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod autostart;
 mod credentials;
 mod discord;
 mod emoji;
@@ -58,11 +59,19 @@ fn main() {
                 store.update(cx, |store, cx| store.login(token, is_bot, cx));
             }
 
+            let tray = tray::create(tray_tx.clone());
+            let has_tray = tray.is_some();
+            cx.set_global(TrayHolder(tray));
+            // Started by Windows at sign-in: wait in the tray until wanted.
+            let start_hidden = has_tray && autostart::launched_at_startup();
+
             let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(820.), px(480.))),
                 titlebar: Some(TitlebarOptions { title: Some("Ferrocord".into()), ..Default::default() }),
+                show: !start_hidden,
+                focus: !start_hidden,
                 ..Default::default()
             };
             let checker = store.clone();
@@ -85,9 +94,6 @@ fn main() {
 
             // Closing the window hides it to the tray, unless that is turned off
             // in settings or the tray icon could not be created.
-            let tray = tray::create(tray_tx.clone());
-            let has_tray = tray.is_some();
-            cx.set_global(TrayHolder(tray));
             let quitting = Arc::new(AtomicBool::new(false));
             let quitting_check = quitting.clone();
             let _ = window.update(cx, |_, window, cx| {
@@ -144,7 +150,9 @@ fn main() {
             if std::env::args().any(|arg| arg == "--demo-settings") {
                 cx.dispatch_action(&ui::ToggleSettings);
             }
-            cx.activate(true);
+            if !start_hidden {
+                cx.activate(true);
+            }
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();

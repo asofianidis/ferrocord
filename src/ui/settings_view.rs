@@ -31,6 +31,10 @@ pub struct SettingsView {
     /// Listens to the microphone while settings are open, for the level meter.
     mic_test: Option<crate::voice::MicTest>,
     mic_problem: Option<String>,
+    /// Whether Windows starts the app at sign-in, read from the registry.
+    start_with_windows: bool,
+    /// Why the last change to that could not be made.
+    autostart_problem: Option<String>,
     _subs: Vec<Subscription>,
 }
 
@@ -117,6 +121,8 @@ impl SettingsView {
             sensitivity,
             mic_test: None,
             mic_problem: None,
+            start_with_windows: crate::autostart::is_enabled(),
+            autostart_problem: None,
             _subs: subs,
         };
         view.restart_mic_test();
@@ -544,6 +550,24 @@ impl Render for SettingsView {
                                     )
                                 },
                             )))
+                            .child(Self::section("WHEN YOU SIGN IN TO WINDOWS"))
+                            .child(h_flex().gap_2().children([(true, "Start Ferrocord in the tray"), (false, "Don't start")].into_iter().map(
+                                |(value, label)| {
+                                    Self::pill(SharedString::from(format!("autostart-{value}")), label, self.start_with_windows == value)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            match crate::autostart::set(value) {
+                                                Ok(()) => this.autostart_problem = None,
+                                                Err(e) => {
+                                                    log::warn!("could not change the sign-in entry: {e}");
+                                                    this.autostart_problem = Some(format!("Could not change this: {e}"));
+                                                }
+                                            }
+                                            this.start_with_windows = crate::autostart::is_enabled();
+                                            cx.notify();
+                                        }))
+                                },
+                            )))
+                            .when_some(self.autostart_problem.clone(), |d, problem| d.child(div().pt_1().text_size(px(12.)).text_color(theme::text_muted()).child(problem)))
                     })
                     .child(Self::section("STATUS"))
                     .child(h_flex().gap_2().children(

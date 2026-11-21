@@ -60,7 +60,7 @@ winresource = "0.1"
 
 [target."cfg(windows)".dependencies]
 tray-icon = "0.26.1"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
 opt-level = 3
