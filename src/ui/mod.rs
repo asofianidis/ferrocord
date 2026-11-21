@@ -15,6 +15,7 @@ mod settings_view;
 mod sidebar;
 mod switcher;
 pub mod theme;
+mod user_menu;
 mod widgets;
 
 use crate::{
@@ -174,7 +175,15 @@ impl AppView {
     }
 
     pub fn show_profile(&mut self, user: crate::discord::Id, at: Point<Pixels>, cx: &mut Context<Self>) {
-        self.chat.update(cx, |chat, cx| chat.show_profile(user, at, Anchor::TopRight, cx));
+        self.show_profile_anchored(user, at, Anchor::TopRight, cx);
+    }
+
+    pub fn show_profile_anchored(&mut self, user: crate::discord::Id, at: Point<Pixels>, side: Anchor, cx: &mut Context<Self>) {
+        self.chat.update(cx, |chat, cx| chat.show_profile(user, at, side, cx));
+    }
+
+    pub fn mention(&mut self, user: crate::discord::Id, window: &mut Window, cx: &mut Context<Self>) {
+        self.chat.update(cx, |chat, cx| chat.insert_mention(user, window, cx));
     }
 
     /// Offers a downloaded-and-verified update, unless closed for this run.

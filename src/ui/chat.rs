@@ -1221,6 +1221,25 @@ impl ChatView {
             }))
     }
 
+    /// Adds `@name` for `user` to the message box (sent as a proper mention).
+    pub fn insert_mention(&mut self, user: Id, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        let guild = self.channel.and_then(|c| store.channels.get(&c)).and_then(|c| c.guild_id);
+        let Some(person) = store.users.get(&user) else { return };
+        let shown = format!("@{}", store.display_name(guild, person));
+        if !self.replacements.iter().any(|(s, _)| *s == shown) {
+            self.replacements.push((shown.clone(), format!("<@{user}>")));
+        }
+        let current = self.composer.read(cx).value().to_string();
+        let joiner = if current.is_empty() || current.ends_with(' ') { "" } else { " " };
+        let text = format!("{current}{joiner}{shown} ");
+        self.composer.update(cx, |s, cx| {
+            s.set_value(text, window, cx);
+            s.focus(window, cx);
+        });
+        cx.notify();
+    }
+
     /// Opens a user's profile card beside the point that was clicked.
     pub fn show_profile(&mut self, user: Id, at: Point<Pixels>, side: Anchor, cx: &mut Context<Self>) {
         self.profile = Some(ProfileCard { user, at, side });
@@ -1488,14 +1507,25 @@ impl ChatView {
                     .gap_2()
                     .items_baseline()
                     .child(
+                        // The menu lives on a plain wrapper so it does not inherit
+                        // the name's colour, weight and hover underline.
                         div()
                             .id("author")
-                            .cursor_pointer()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(name_color)
-                            .hover(|s| s.underline())
-                            .child(name.clone())
-                            .on_click(show_profile.clone()),
+                            .child(
+                                div()
+                                    .id("author-name")
+                                    .cursor_pointer()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(name_color)
+                                    .hover(|s| s.underline())
+                                    .child(name.clone())
+                                    .on_click(show_profile.clone()),
+                            )
+                            .context_menu({
+                                let store = self.store.clone();
+                                let author = m.author.id;
+                                move |menu, _, cx| super::user_menu::user_menu(menu, store.clone(), author, guild, cx)
+                            }),
                     )
                     .when(m.author.bot, |d| d.child(bot_tag()))
                     .child(
@@ -1652,6 +1682,11 @@ impl ChatView {
                 .cursor_pointer()
                 .child(avatar(m.author.avatar_url(128), 40.))
                 .on_click(show_profile)
+                .context_menu({
+                    let store = self.store.clone();
+                    let author = m.author.id;
+                    move |menu, _, cx| super::user_menu::user_menu(menu, store.clone(), author, guild, cx)
+                })
                 .into_any_element()
         };
 

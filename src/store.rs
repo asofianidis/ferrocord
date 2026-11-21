@@ -1145,6 +1145,13 @@ impl Store {
         });
     }
 
+    /// Sends a friend request to a user we can see.
+    pub fn send_friend_request(&mut self, user: Id, cx: &mut Context<Self>) {
+        self.relationship_call(Some(user), Some(4), "Could not send friend request", cx, move |rest| async move {
+            rest.accept_friend(user).await
+        });
+    }
+
     pub fn remove_relationship(&mut self, user: Id, cx: &mut Context<Self>) {
         self.relationship_call(Some(user), None, "Could not update relationship", cx, move |rest| async move {
             rest.remove_relationship(user).await
@@ -2312,6 +2319,16 @@ impl Store {
         self.voice_conn = None;
         self.voice_conn =
             Some(VoiceConnection::start(self.runtime.clone(), &options, self.my_id(), self.self_mute, self.self_deaf, tx));
+        // Our own per-person volumes and mutes carry over between calls.
+        let saved = crate::settings::Settings::load();
+        if let Some(conn) = &self.voice_conn {
+            for (user, volume) in &saved.user_volumes {
+                conn.set_user_gain(Id(*user), *volume);
+            }
+            for user in &saved.local_mutes {
+                conn.set_user_gain(Id(*user), 0.0);
+            }
+        }
         self.voice_epoch += 1;
         let epoch = self.voice_epoch;
         cx.spawn(async move |this, cx| {
@@ -2504,6 +2521,48 @@ impl Store {
         if let Some(conn) = &self.voice_conn {
             conn.set_sensitivity(db);
         }
+    }
+
+    pub fn locally_muted(&self, user: Id) -> bool {
+        crate::settings::Settings::load().local_mutes.contains(&user.0)
+    }
+
+    pub fn user_volume(&self, user: Id) -> f32 {
+        crate::settings::Settings::load().user_volumes.get(&user.0).copied().unwrap_or(1.0)
+    }
+
+    /// Pushes a user's effective volume (zero when muted for us) to the call.
+    fn apply_user_gain(&self, user: Id) {
+        if let Some(conn) = &self.voice_conn {
+            let gain = if self.locally_muted(user) { 0.0 } else { self.user_volume(user) };
+            conn.set_user_gain(user, gain);
+        }
+    }
+
+    pub fn set_user_volume(&mut self, user: Id, volume: f32, cx: &mut Context<Self>) {
+        crate::settings::Settings::update(|s| {
+            if (volume - 1.0).abs() < 0.01 {
+                s.user_volumes.remove(&user.0);
+            } else {
+                s.user_volumes.insert(user.0, volume);
+            }
+        });
+        self.apply_user_gain(user);
+        cx.notify();
+    }
+
+    /// Mutes or unmutes someone for us alone.
+    pub fn toggle_local_mute(&mut self, user: Id, cx: &mut Context<Self>) {
+        crate::settings::Settings::update(|s| {
+            if let Some(ix) = s.local_mutes.iter().position(|u| *u == user.0) {
+                s.local_mutes.remove(ix);
+            } else {
+                s.local_mutes.push(user.0);
+            }
+        });
+        self.apply_user_gain(user);
+        cx.emit(StoreEvent::Voice);
+        cx.notify();
     }
 
     pub fn set_input_volume(&mut self, volume: f32) {

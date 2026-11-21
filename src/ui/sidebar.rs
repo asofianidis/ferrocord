@@ -53,18 +53,30 @@ impl Sidebar {
                 };
                 let speaking = store.speaking.contains(&id);
                 let flags = store.voice_member(id).map(call::voice_flags);
+                let menu_store = self.store.clone();
                 out.push(
                     h_flex()
+                        .id(("voice-user", id.0))
                         .w_full()
                         .h(px(32.))
                         .pl(px(38.))
                         .pr_2()
                         .gap_1p5()
-                        .text_size(px(13.))
-                        .text_color(if speaking { theme::text_bright() } else { theme::text_muted() })
+                        .rounded_md()
+                        .hover(|s| s.bg(theme::bg_hover()))
                         .child(call::voice_avatar(url, 18., speaking))
-                        .child(div().flex_1().min_w_0().truncate().child(name))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(13.))
+                                .text_color(if speaking { theme::text_bright() } else { theme::text_muted() })
+                                .child(name),
+                        )
                         .children(flags)
+                        .on_click(move |event, _, cx| form::open_profile_beside(id, event.position(), cx))
+                        .context_menu(move |menu, _, cx| super::user_menu::user_menu(menu, menu_store.clone(), id, guild, cx))
                         .into_any_element(),
                 );
                 continue;

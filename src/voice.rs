@@ -420,6 +420,8 @@ struct Shared {
     stats: Mutex<Stats>,
     has_mic: AtomicBool,
     ssrc_users: Mutex<HashMap<u32, u64>>,
+    /// Our own volume per user (0 mutes them for us alone).
+    user_gains: Mutex<HashMap<u64, f32>>,
     /// When each SSRC last carried audible voice.
     heard: Mutex<HashMap<u32, Instant>>,
     events: async_channel::Sender<VoiceEvent>,
@@ -566,10 +568,16 @@ impl EventHandler for Receiver {
                     if energy.sqrt() > SPEAKING_RMS {
                         shared.heard.lock().insert(*ssrc, now);
                     }
-                    if !deaf {
+                    let gain = shared
+                        .ssrc_users
+                        .lock()
+                        .get(ssrc)
+                        .and_then(|user| shared.user_gains.lock().get(user).copied())
+                        .unwrap_or(1.0);
+                    if !deaf && gain > 0.0 {
                         quiet = false;
                         for (slot, s) in mix.iter_mut().zip(pcm) {
-                            *slot += *s as f32 / 32768.0;
+                            *slot += gain * *s as f32 / 32768.0;
                         }
                     }
                 }
@@ -769,6 +777,7 @@ impl VoiceConnection {
             stats: Mutex::new(Stats::default()),
             has_mic: AtomicBool::new(false),
             ssrc_users: Mutex::new(HashMap::new()),
+            user_gains: Mutex::new(HashMap::new()),
             heard: Mutex::new(HashMap::new()),
             events: events.clone(),
         });
@@ -862,6 +871,16 @@ impl VoiceConnection {
 
     pub fn set_sensitivity(&self, db: f32) {
         self.shared.threshold.store(db_to_linear(db).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Our own playback volume for one user (0 mutes them for us alone).
+    pub fn set_user_gain(&self, user: Id, gain: f32) {
+        let mut gains = self.shared.user_gains.lock();
+        if (gain - 1.0).abs() < f32::EPSILON {
+            gains.remove(&user.0);
+        } else {
+            gains.insert(user.0, gain);
+        }
     }
 
     pub fn set_input_volume(&self, volume: f32) {
@@ -1075,6 +1094,7 @@ mod tests {
             stats: Mutex::new(Stats::default()),
             has_mic: AtomicBool::new(true),
             ssrc_users: Mutex::new(HashMap::new()),
+            user_gains: Mutex::new(HashMap::new()),
             heard: Mutex::new(HashMap::new()),
             events: tx,
         })

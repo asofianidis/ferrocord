@@ -4,7 +4,7 @@
 use super::{theme, widgets::*};
 use crate::{
     discord::{Id, channel_kind},
-    store::{Store, VoiceMember, VoiceModeration, VoiceStatus},
+    store::{Store, VoiceMember, VoiceStatus},
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
@@ -98,8 +98,6 @@ pub fn call_panel(
     let status = joined.map(|s| s.status.clone());
     let is_bot_on_dm = is_dm && store.me.as_ref().is_some_and(|u| u.bot);
     let moderator = guild.is_some() && store.is_stage_moderator(channel);
-    let can_moderate_voice = guild.is_some()
-        && store.has_permission(channel, crate::discord::permissions::MUTE_MEMBERS);
     let topic = store.stages.get(&channel).cloned();
     let my_member = members.iter().find(|m| m.user == me).cloned();
 
@@ -134,41 +132,23 @@ pub fn call_panel(
                     .when(member.hand_raised, |d| d.child(icon(IconName::Hand, 13., theme::warning()))),
             )
             .on_click(move |event, _, cx| on_profile(user, event.position(), cx));
-        let Some(guild) = guild.filter(|_| (moderator || can_moderate_voice) && user != me) else {
-            return element.into_any_element();
-        };
         let entity = store_entity.clone();
         let member = member.clone();
+        let stage_moderator = is_stage && moderator && user != me;
         element
-            .context_menu(move |menu, _, _| {
-                let act = |change: VoiceModeration| {
-                    let entity = entity.clone();
-                    move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                        entity.update(cx, |s, cx| s.moderate_voice(guild, member.user, change, cx));
-                    }
-                };
+            .context_menu(move |menu, _, cx| {
                 let mut menu = menu;
-                if is_stage && moderator {
+                if stage_moderator {
                     let entity = entity.clone();
                     let on_stage = member.suppress;
                     let label = if on_stage { "Invite to Speak" } else { "Move to Audience" };
-                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                        entity.update(cx, |s, cx| s.set_on_stage(channel, Some(member.user), on_stage, cx));
-                    }));
-                }
-                if can_moderate_voice {
                     menu = menu
-                        .item(
-                            PopupMenuItem::new(if member.mute { "Server Unmute" } else { "Server Mute" })
-                                .on_click(act(VoiceModeration::Mute(!member.mute))),
-                        )
-                        .item(
-                            PopupMenuItem::new(if member.deaf { "Server Undeafen" } else { "Server Deafen" })
-                                .on_click(act(VoiceModeration::Deafen(!member.deaf))),
-                        )
-                        .item(PopupMenuItem::new("Disconnect").on_click(act(VoiceModeration::Disconnect)));
+                        .item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                            entity.update(cx, |s, cx| s.set_on_stage(channel, Some(member.user), on_stage, cx));
+                        }))
+                        .separator();
                 }
-                menu
+                super::user_menu::user_menu(menu, entity.clone(), user, guild, cx)
             })
             .into_any_element()
     };

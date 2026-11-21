@@ -21,6 +21,10 @@ pub struct Settings {
     pub output_volume: f32,
     /// Play sounds when joining, leaving, muting and deafening.
     pub voice_sounds: bool,
+    /// Our own volume for particular people in voice (1.0 = 100%).
+    pub user_volumes: std::collections::HashMap<u64, f32>,
+    /// People muted for us alone.
+    pub local_mutes: Vec<u64>,
 }
 
 impl Default for Settings {
@@ -35,6 +39,8 @@ impl Default for Settings {
             input_volume: 1.0,
             output_volume: 1.0,
             voice_sounds: true,
+            user_volumes: Default::default(),
+            local_mutes: Vec::new(),
         }
     }
 }
