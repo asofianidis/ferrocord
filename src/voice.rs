@@ -386,6 +386,19 @@ impl StereoResampler {
 
 // ------------------------------------------------------------------ shared state
 
+/// What happened to our audio over the last second, for diagnosing "they
+/// can't hear me": was the mic loud enough, did the gate open, and did
+/// songbird actually take audio from us.
+#[derive(Default)]
+struct Stats {
+    /// Loudest capture callback, in dBFS (after input volume).
+    mic_peak_db: Option<f32>,
+    captured: usize,
+    /// Samples songbird read, and how many of those were real (not filler).
+    read: usize,
+    read_real: usize,
+}
+
 struct Shared {
     /// Mono microphone samples at the input device's rate.
     mic: Mutex<MicBuffer>,
@@ -403,6 +416,8 @@ struct Shared {
     output_gain: AtomicU32,
     /// When the microphone last heard something above the threshold.
     last_loud: Mutex<Option<Instant>>,
+    /// Counters for the once-a-second voice log line.
+    stats: Mutex<Stats>,
     has_mic: AtomicBool,
     ssrc_users: Mutex<HashMap<u32, u64>>,
     /// When each SSRC last carried audible voice.
@@ -470,8 +485,14 @@ impl MicSource {
             }
             mic.take(want, &mut self.scratch);
         }
+        let real = self.scratch.len();
         if self.scratch.is_empty() {
             self.scratch.resize(want.min(self.silence), 0.0);
+        }
+        {
+            let mut stats = self.shared.stats.lock();
+            stats.read += self.scratch.len();
+            stats.read_real += real;
         }
         let target = if open { 1.0 } else { 0.0 };
         for sample in &mut self.scratch {
@@ -616,6 +637,12 @@ fn open_input(shared: Arc<Shared>, wanted: Option<&str>) -> Result<(cpal::Stream
                 }));
                 let rms = (mono.iter().map(|s| s * s).sum::<f32>() / mono.len().max(1) as f32).sqrt();
                 let loud = rms >= shared.threshold();
+                {
+                    let mut stats = shared.stats.lock();
+                    let db = rms_db(&mono);
+                    stats.mic_peak_db = Some(stats.mic_peak_db.map_or(db, |p| p.max(db)));
+                    stats.captured += mono.len();
+                }
                 if loud {
                     *shared.last_loud.lock() = Some(Instant::now());
                 }
@@ -739,6 +766,7 @@ impl VoiceConnection {
             input_gain: AtomicU32::new(options.input_volume.to_bits()),
             output_gain: AtomicU32::new(options.output_volume.to_bits()),
             last_loud: Mutex::new(None),
+            stats: Mutex::new(Stats::default()),
             has_mic: AtomicBool::new(false),
             ssrc_users: Mutex::new(HashMap::new()),
             heard: Mutex::new(HashMap::new()),
@@ -871,9 +899,29 @@ async fn pump(driver: Arc<tokio::sync::Mutex<Driver>>, shared: Arc<Shared>, self
     let mut sending = false;
     let mut closed_at: Option<Instant> = None;
     let mut last_reported: HashSet<Id> = HashSet::new();
+    let (mut ticks, mut open_ticks, mut sending_ticks) = (0u32, 0u32, 0u32);
     loop {
         interval.tick().await;
         let transmit = shared.transmitting();
+        ticks += 1;
+        open_ticks += transmit as u32;
+        sending_ticks += sending as u32;
+        if ticks == 50 {
+            let stats = std::mem::take(&mut *shared.stats.lock());
+            log::info!(
+                "voice: mic peak {} (sensitivity {:.0} dB), captured {}, songbird read {} ({} real), gate open {}%, sending {}%{}{}",
+                stats.mic_peak_db.map_or("none".to_string(), |db| format!("{db:.0} dB")),
+                20.0 * shared.threshold().max(1e-5).log10(),
+                stats.captured,
+                stats.read,
+                stats.read_real,
+                open_ticks * 2,
+                sending_ticks * 2,
+                if shared.muted.load(Ordering::Relaxed) { ", muted" } else { "" },
+                if shared.has_mic.load(Ordering::Relaxed) { "" } else { ", no microphone" },
+            );
+            (ticks, open_ticks, sending_ticks) = (0, 0, 0);
+        }
         // Unmute as soon as the gate opens (the microphone fades in), but mute
         // only once the fade-out has been sent, so speech never stops mid-wave.
         let send = if transmit {
@@ -1020,6 +1068,7 @@ mod tests {
             input_gain: AtomicU32::new(1f32.to_bits()),
             output_gain: AtomicU32::new(1f32.to_bits()),
             last_loud: Mutex::new(loud.then(Instant::now)),
+            stats: Mutex::new(Stats::default()),
             has_mic: AtomicBool::new(true),
             ssrc_users: Mutex::new(HashMap::new()),
             heard: Mutex::new(HashMap::new()),
