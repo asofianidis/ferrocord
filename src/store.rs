@@ -170,6 +170,8 @@ pub struct VoiceSession {
     session_id: Option<String>,
     /// Token and endpoint from `VOICE_SERVER_UPDATE`.
     server: Option<(String, String)>,
+    /// Already rejoined once after the voice session was dropped.
+    retried: bool,
 }
 
 #[derive(Default)]
@@ -1017,6 +1019,18 @@ impl Store {
     fn member_list_channel(&self, channel: Id) -> Id {
         match self.channels.get(&channel) {
             Some(c) if c.is_thread() => c.parent_id.unwrap_or(channel),
+            // Discord sends no member list for voice channels (their chat
+            // included); show the server's, from its first text channel.
+            Some(c) if c.is_voice() => c
+                .guild_id
+                .and_then(|g| self.guild(g))
+                .and_then(|g| {
+                    g.rows.iter().find(|r| {
+                        r.kind == RowKind::Channel
+                            && self.channels.get(&r.id).is_some_and(|c| c.is_text_like() && !c.is_voice() && !c.is_thread())
+                    })
+                })
+                .map_or(channel, |r| r.id),
             _ => channel,
         }
     }
@@ -2218,10 +2232,18 @@ impl Store {
             if let Some(session) = self.voice_session.as_mut() {
                 match state.channel_id {
                     Some(channel) => {
-                        // A moderator may have moved us; follow along.
+                        // Discord repeats our voice state whenever anything about it
+                        // changes (muting, for one). Reconnecting each time makes the
+                        // voice server drop the session, so only reconnect when we
+                        // were moved, got a new session, or are not connected yet.
+                        let moved = session.channel != channel;
+                        let new_session = session.session_id.as_deref() != Some(state.session_id.as_str());
+                        let idle = matches!(session.status, VoiceStatus::Joining | VoiceStatus::Failed(_));
                         session.channel = channel;
                         session.session_id = Some(state.session_id.clone());
-                        self.try_connect_voice(cx);
+                        if moved || new_session || idle {
+                            self.try_connect_voice(cx);
+                        }
                     }
                     None if session.status != VoiceStatus::Joining => {
                         crate::sounds::play(crate::sounds::Sound::Leave);
@@ -2233,6 +2255,24 @@ impl Store {
             }
         }
         cx.emit(StoreEvent::Voice);
+    }
+
+    /// Leaves and rejoins the current voice channel to get a fresh session.
+    fn rejoin_voice(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.voice_session.as_mut() else { return };
+        let (channel, guild) = (session.channel, session.guild);
+        session.status = VoiceStatus::Joining;
+        session.session_id = None;
+        session.server = None;
+        cx.emit(StoreEvent::Voice);
+        if self.demo {
+            if let Some(session) = self.voice_session.as_mut() {
+                session.status = VoiceStatus::Connected;
+            }
+            return;
+        }
+        self.send_voice_state(None, guild);
+        self.send_voice_state(Some(channel), guild);
     }
 
     fn try_connect_voice(&mut self, cx: &mut Context<Self>) {
@@ -2303,10 +2343,18 @@ impl Store {
                 }
             }
             VoiceEvent::Disconnected(reason) => {
-                if let Some(session) = self.voice_session.as_mut() {
+                let retry = self.voice_session.as_mut().is_some_and(|session| {
+                    let retry = !session.retried && reason.contains("SessionInvalid");
+                    session.retried |= retry;
                     session.status = VoiceStatus::Failed(reason);
-                }
+                    retry
+                });
                 self.speaking.clear();
+                if retry {
+                    // The voice server dropped our session: ask Discord for a fresh one.
+                    log::warn!("voice session was invalidated; rejoining");
+                    self.rejoin_voice(cx);
+                }
             }
             VoiceEvent::Speaking(mut users) => {
                 if self.demo {
@@ -2324,7 +2372,11 @@ impl Store {
         let Some(info) = self.channels.get(&channel) else { return };
         let guild = info.guild_id;
         let is_stage = info.kind == channel_kind::STAGE;
-        if self.voice_session.as_ref().is_some_and(|s| s.channel == channel) {
+        if let Some(session) = self.voice_session.as_ref().filter(|s| s.channel == channel) {
+            // Clicking the channel again after voice failed tries again.
+            if matches!(session.status, VoiceStatus::Failed(_)) {
+                self.rejoin_voice(cx);
+            }
             return;
         }
         if guild.is_none() && self.rest.as_ref().is_some_and(|r| r.is_bot()) {
@@ -2337,7 +2389,7 @@ impl Store {
         }
         self.speaking.clear();
         self.voice_session =
-            Some(VoiceSession { channel, guild, status: VoiceStatus::Joining, session_id: None, server: None });
+            Some(VoiceSession { channel, guild, status: VoiceStatus::Joining, session_id: None, server: None, retried: false });
         self.start_voice_connection(cx);
 
         if self.demo {
@@ -3665,8 +3717,13 @@ impl Store {
                     return;
                 }
                 if let Some(endpoint) = endpoint {
-                    session.server = Some((token, endpoint));
-                    self.try_connect_voice(cx);
+                    let server = Some((token, endpoint));
+                    let changed = session.server != server;
+                    let idle = matches!(session.status, VoiceStatus::Joining | VoiceStatus::Failed(_));
+                    session.server = server;
+                    if changed || idle {
+                        self.try_connect_voice(cx);
+                    }
                 }
             }
             Event::Call { channel_id, ringing, ended } => {

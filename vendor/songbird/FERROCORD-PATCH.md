@@ -10,4 +10,8 @@ packets are trimmed so the decoder sees only the Opus frame. Unpatched, every
 packet from a DAVE-encrypted call failed with `opus_decode ... InvalidPacket`
 ("Decode error for SSRC ...") and that person could not be heard.
 
+A second, cosmetic change in the same file: "RTCP decryption failed" is logged
+at debug rather than warning level. RTCP reports fail to decrypt in the rtpsize
+encryption modes, are not used, and the warning fired many times a second.
+
 Remove this directory and the patch entry once a songbird release fixes it.

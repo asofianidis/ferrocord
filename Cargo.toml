@@ -1,6 +1,6 @@
 [package]
 name = "ferrocord"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 description = "A fast, native Discord client written in Rust"
 

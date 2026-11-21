@@ -30,7 +30,7 @@ use std::{
     time::Duration,
 };
 use tokio::{net::UdpSocket, select, time::Instant};
-use tracing::{error, instrument, trace, warn};
+use tracing::{debug, error, instrument, trace, warn};
 
 type RtpSequence = Wrapping<u16>;
 type RtpTimestamp = Wrapping<u32>;
@@ -306,7 +306,10 @@ impl UdpRx {
                     let out = self.cipher.decrypt_rtcp_in_place(&mut rtcp);
 
                     if let Err(ref e) = out {
-                        warn!("RTCP decryption failed: {:?}", e);
+                        // ferrocord patch: RTCP reports fail to decrypt in the
+                        // rtpsize modes and are not needed; this fired many
+                        // times a second.
+                        debug!("RTCP decryption failed: {:?}", e);
                     }
 
                     out.ok()
