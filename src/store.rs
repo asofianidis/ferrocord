@@ -230,6 +230,11 @@ pub struct Store {
     /// Progress of an email-and-password sign-in, and its latest error.
     pub auth_step: AuthStep,
     pub auth_error: Option<String>,
+    pub update_state: UpdateState,
+    /// The update found by the last check, ready to install.
+    pending_update: Option<std::sync::Arc<cargo_packager_updater::Update>>,
+    /// The update banner was closed for this run.
+    pub update_dismissed: bool,
     pub qr_step: QrStep,
     /// Receives the QR sign-in's progress; dropping it ends the attempt.
     qr_task: Option<gpui::Task<()>>,
@@ -265,6 +270,18 @@ pub struct AuditLog {
     pub entries: Vec<discord::audit::AuditEntry>,
     /// Users the log mentions, for naming targets.
     pub users: HashMap<Id, User>,
+}
+
+/// Where checking for and installing an update has got to.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum UpdateState {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    Available { version: String, notes: Option<String> },
+    Installing,
+    Failed(String),
 }
 
 /// Where a QR-code sign-in has got to.
@@ -365,6 +382,9 @@ impl Store {
             auth_step: AuthStep::Idle,
             auth_error: None,
             auth_session: None,
+            update_state: UpdateState::Idle,
+            pending_update: None,
+            update_dismissed: false,
             qr_step: QrStep::Off,
             qr_task: None,
             events: HashMap::new(),
@@ -485,6 +505,59 @@ impl Store {
             }
             Err(e) => store.auth_failed(e.to_string(), cx),
         });
+    }
+
+    // ---------------------------------------------------------------- updates
+
+    pub fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.update_state, UpdateState::Checking | UpdateState::Installing) {
+            return;
+        }
+        self.update_state = UpdateState::Checking;
+        cx.notify();
+        self.run(
+            cx,
+            async { tokio::task::spawn_blocking(crate::updater::check).await? },
+            |store, result, cx| {
+                match result {
+                    Ok(Some(update)) => {
+                        store.update_state =
+                            UpdateState::Available { version: update.version.clone(), notes: update.body.clone() };
+                        store.pending_update = Some(std::sync::Arc::new(update));
+                    }
+                    Ok(None) => store.update_state = UpdateState::UpToDate,
+                    Err(e) => {
+                        log::warn!("update check failed: {e}");
+                        store.update_state = UpdateState::Failed(e.to_string());
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Installs the update found earlier. The app closes and the installer
+    /// starts it again.
+    pub fn install_update(&mut self, cx: &mut Context<Self>) {
+        let Some(update) = self.pending_update.clone() else { return };
+        self.update_state = UpdateState::Installing;
+        cx.notify();
+        self.run(
+            cx,
+            async move { tokio::task::spawn_blocking(move || crate::updater::install(&update)).await? },
+            |store, result, cx| {
+                // Reaching here means the installer did not take over.
+                if let Err(e) = result {
+                    store.update_state = UpdateState::Failed(format!("Could not install the update: {e}"));
+                    cx.notify();
+                }
+            },
+        );
+    }
+
+    pub fn dismiss_update(&mut self, cx: &mut Context<Self>) {
+        self.update_dismissed = true;
+        cx.notify();
     }
 
     /// Starts a QR-code sign-in (or a fresh one, replacing an expired code).

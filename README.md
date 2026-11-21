@@ -101,6 +101,14 @@ To look around without signing in, load offline sample data:
 cargo run -- --demo
 ```
 
+### Releases and updates
+
+Every push to `main` is tested and built by GitHub Actions; the installer is attached to the run. When a push changes `version` in `Cargo.toml`, the workflow also publishes a GitHub release with the signed installer and `latest.json`.
+
+Installed copies check that release on startup and every six hours, and offer "Restart to update" when a newer version is out (also under Settings, Updates). Installers are verified against the public key in `assets/update-key.pub` before they run. The matching private key and its password are repository secrets (`CARGO_PACKAGER_SIGN_PRIVATE_KEY`, `CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD`); without them no update can be published.
+
+To release: bump `version` in `Cargo.toml` and push to `main`.
+
 ### Windows installer
 
 ```sh

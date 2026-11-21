@@ -560,6 +560,35 @@ impl Render for SettingsView {
                             },
                         ),
                     ))
+                    .child(Self::section("UPDATES"))
+                    .child({
+                        let state = self.store.read(cx).update_state.clone();
+                        let status = match &state {
+                            crate::store::UpdateState::Idle => String::new(),
+                            crate::store::UpdateState::Checking => "Checking\u{2026}".into(),
+                            crate::store::UpdateState::UpToDate => "You have the latest version.".into(),
+                            crate::store::UpdateState::Available { version, .. } => format!("Version {version} is available."),
+                            crate::store::UpdateState::Installing => "Downloading the update\u{2026}".into(),
+                            crate::store::UpdateState::Failed(e) => e.clone(),
+                        };
+                        let available = matches!(state, crate::store::UpdateState::Available { .. });
+                        h_flex()
+                            .gap_3()
+                            .child(div().text_color(theme::text_bright()).child(format!("Ferrocord {}", crate::updater::current_version())))
+                            .child(
+                                Self::pill(
+                                    "update-action",
+                                    if available { "Restart to update" } else { "Check for updates" },
+                                    available,
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.store.update(cx, |s, cx| {
+                                        if available { s.install_update(cx) } else { s.check_for_updates(cx) }
+                                    })
+                                })),
+                            )
+                            .child(div().flex_1().min_w_0().text_size(px(12.)).text_color(theme::text_muted()).child(status))
+                    })
                     .child(Self::section("ACCOUNT"))
                     .when_some(me, |d, me| {
                         d.child(

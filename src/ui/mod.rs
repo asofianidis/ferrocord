@@ -177,6 +177,54 @@ impl AppView {
         self.chat.update(cx, |chat, cx| chat.show_profile(user, at, Anchor::TopRight, cx));
     }
 
+    /// Offers a downloaded-and-verified update, unless closed for this run.
+    fn update_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let store = self.store.read(cx);
+        if store.update_dismissed {
+            return None;
+        }
+        let (text, can_install) = match &store.update_state {
+            crate::store::UpdateState::Available { version, .. } => (format!("Ferrocord {version} is available."), true),
+            crate::store::UpdateState::Installing => ("Downloading the update\u{2026}".to_string(), false),
+            _ => return None,
+        };
+        Some(
+            h_flex()
+                .w_full()
+                .h(px(32.))
+                .flex_shrink_0()
+                .justify_center()
+                .gap_3()
+                .bg(theme::accent())
+                .text_color(theme::on_accent())
+                .text_size(px(13.))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(text))
+                .when(can_install, |d| {
+                    d.child(
+                        div()
+                            .id("update-install")
+                            .px_2()
+                            .py_0p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(theme::on_accent())
+                            .child("Restart to update")
+                            .on_click(cx.listener(|this, _, _, cx| this.store.update(cx, |s, cx| s.install_update(cx)))),
+                    )
+                    .child(
+                        div()
+                            .id("update-later")
+                            .cursor_pointer()
+                            .opacity(0.8)
+                            .child("Later")
+                            .on_click(cx.listener(|this, _, _, cx| this.store.update(cx, |s, cx| s.dismiss_update(cx)))),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
     pub fn show_events(&mut self, guild: crate::discord::Id, cx: &mut Context<Self>) {
         let view = cx.new(|cx| events::EventsView::new(self.store.clone(), guild, cx));
         self._events_sub = Some(cx.subscribe(&view, |this, _, _: &events::EventsEvent, cx| {
@@ -296,6 +344,7 @@ impl Render for AppView {
                         }),
                 )
         });
+        let update_banner = self.update_banner(cx);
         let store = self.store.read(cx);
         let root = div()
             .relative()
@@ -359,6 +408,7 @@ impl Render for AppView {
                                 .child("Connection lost. Reconnecting…"),
                         )
                     })
+                    .children(update_banner)
                     .child(
                         h_flex()
                             .flex_1()

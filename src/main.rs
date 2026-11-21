@@ -9,6 +9,7 @@ mod settings;
 mod sounds;
 mod store;
 mod tray;
+mod updater;
 mod voice;
 mod ui;
 
@@ -63,11 +64,23 @@ fn main() {
                 titlebar: Some(TitlebarOptions { title: Some("Ferrocord".into()), ..Default::default() }),
                 ..Default::default()
             };
+            let checker = store.clone();
             let (window, view) =
                 gpui_kit::open_window(options, cx, |window, cx| cx.new(|cx| ui::AppView::new(store, window, cx)))
                     .expect("failed to open the main window");
 
             cx.set_global(ui::form::AppHandle(view.downgrade()));
+
+            // Look for updates now and every six hours (not in development builds).
+            if !cfg!(debug_assertions) && !demo {
+                cx.spawn(async move |cx| {
+                    loop {
+                        let _ = checker.update(cx, |s, cx| s.check_for_updates(cx));
+                        cx.background_executor().timer(std::time::Duration::from_secs(6 * 60 * 60)).await;
+                    }
+                })
+                .detach();
+            }
 
             // Closing the window hides it to the tray, unless that is turned off
             // in settings or the tray icon could not be created.

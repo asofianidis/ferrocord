@@ -1,0 +1,98 @@
+name: Build
+
+# Every push to main and every pull request is tested and built. A push to
+# main whose Cargo.toml version has no release yet also publishes one: the
+# signed installer plus latest.json, which installed copies check for updates.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          "version=$version" >> $env:GITHUB_OUTPUT
+          $tag = "v$version"
+          $exists = git ls-remote --tags origin "refs/tags/$tag"
+          $release = ("${{ github.event_name }}" -ne "pull_request") -and ("${{ github.ref }}" -eq "refs/heads/main") -and (-not $exists)
+          "release=$($release.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --locked
+
+      - name: Build installer
+        shell: pwsh
+        env:
+          # Only pushes to this repository can sign; pull requests build unsigned.
+          SIGN_KEY: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY }}
+          SIGN_PASSWORD: ${{ secrets.CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if ($env:SIGN_KEY) {
+            $env:CARGO_PACKAGER_SIGN_PRIVATE_KEY = $env:SIGN_KEY
+            $env:CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD = $env:SIGN_PASSWORD
+          }
+          cargo packager --release
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferrocord-${{ steps.version.outputs.version }}-${{ github.sha }}
+          path: dist/*-setup.exe*
+          if-no-files-found: error
+
+      - name: Write update manifest
+        if: steps.version.outputs.release == 'true'
+        shell: pwsh
+        run: |
+          $setup = Get-ChildItem dist -Filter "*-setup.exe" | Select-Object -First 1
+          $sig = "$($setup.FullName).sig"
+          if (-not (Test-Path $sig)) { throw "The installer was not signed; check the signing secrets." }
+          $tag = "${{ steps.version.outputs.tag }}"
+          $manifest = [ordered]@{
+            version   = "${{ steps.version.outputs.version }}"
+            notes     = "See https://github.com/${{ github.repository }}/releases/tag/$tag"
+            pub_date  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                url       = "https://github.com/${{ github.repository }}/releases/download/$tag/$($setup.Name)"
+                signature = (Get-Content $sig -Raw).Trim()
+                format    = "nsis"
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM dist/latest.json
+
+      - name: Publish release
+        if: steps.version.outputs.release == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          $files = @(Get-ChildItem dist -Filter "*-setup.exe*" | ForEach-Object FullName) + "dist/latest.json"
+          gh release create $tag @files --target "${{ github.sha }}" --title "Ferrocord ${{ steps.version.outputs.version }}" --generate-notes
