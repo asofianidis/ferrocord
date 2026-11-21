@@ -126,6 +126,16 @@ The icon is drawn by `assets/make_icon.py`.
 
 Right-click a message for reply, edit, react, copy, pin and delete.
 
+## Signing in
+
+The login screen offers three ways in:
+
+- **QR code** (the default): scan the code with the Discord app on your phone (Settings, then Scan QR Code) and approve the login there. No password or two-factor code is entered in Ferrocord.
+- **Password**: your email or phone number and password, then an authenticator, backup or texted code if you use two-factor authentication. Discord may ask for a captcha, which Ferrocord cannot show, and has been seen rejecting valid two-factor codes from third-party clients; if so, use the QR code.
+- **Token**: a bot token or a personal account token.
+
+In every case only the resulting token is stored, in the operating system's credential store.
+
 ## A note on tokens
 
 A bot token is the option Discord sanctions for third-party software. Signing in with a personal account token is against Discord's terms of service and can get an account restricted. ferrocord identifies itself honestly to Discord rather than imitating the official client.

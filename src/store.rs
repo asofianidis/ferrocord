@@ -226,6 +226,9 @@ pub struct Store {
     /// Progress of an email-and-password sign-in, and its latest error.
     pub auth_step: AuthStep,
     pub auth_error: Option<String>,
+    pub qr_step: QrStep,
+    /// Receives the QR sign-in's progress; dropping it ends the attempt.
+    qr_task: Option<gpui::Task<()>>,
     /// The session of the sign-in in progress; two-factor codes must use it.
     auth_session: Option<std::sync::Arc<discord::auth::Auth>>,
     /// About-me text and pronouns, fetched when settings open (user accounts).
@@ -255,6 +258,21 @@ pub struct AuditLog {
     pub entries: Vec<discord::audit::AuditEntry>,
     /// Users the log mentions, for naming targets.
     pub users: HashMap<Id, User>,
+}
+
+/// Where a QR-code sign-in has got to.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum QrStep {
+    #[default]
+    Off,
+    /// Connecting and preparing a code.
+    Starting,
+    /// Show this address as a QR code.
+    Code(String),
+    /// Scanned; waiting for approval on the phone.
+    Scanned { username: String, avatar_url: Option<String> },
+    /// Expired, declined or failed, with what to tell the user.
+    Ended(String),
 }
 
 /// Where an email-and-password sign-in has got to.
@@ -339,6 +357,8 @@ impl Store {
             auth_step: AuthStep::Idle,
             auth_error: None,
             auth_session: None,
+            qr_step: QrStep::Off,
+            qr_task: None,
             events: HashMap::new(),
             interested: Default::default(),
             gateway_session: String::new(),
@@ -457,6 +477,66 @@ impl Store {
             }
             Err(e) => store.auth_failed(e.to_string(), cx),
         });
+    }
+
+    /// Starts a QR-code sign-in (or a fresh one, replacing an expired code).
+    pub fn start_qr_login(&mut self, cx: &mut Context<Self>) {
+        let (tx, rx) = async_channel::unbounded();
+        self.runtime.spawn(discord::remote_auth::run(tx));
+        self.qr_step = QrStep::Starting;
+        self.auth_error = None;
+        // Replacing the old task drops its receiver, which ends that attempt.
+        self.qr_task = Some(cx.spawn(async move |this, cx| {
+            while let Ok(update) = rx.recv().await {
+                let keep_going = this.update(cx, |store, cx| store.apply_qr(update, cx)).unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    /// Returns whether to keep listening.
+    fn apply_qr(&mut self, update: discord::remote_auth::Update, cx: &mut Context<Self>) -> bool {
+        use discord::remote_auth::Update;
+        let keep_going = match update {
+            Update::Code(url) => {
+                self.qr_step = QrStep::Code(url);
+                true
+            }
+            Update::Scanned { username, avatar_url } => {
+                self.qr_step = QrStep::Scanned { username, avatar_url };
+                true
+            }
+            Update::Token(token) => {
+                self.qr_step = QrStep::Off;
+                self.qr_task = None;
+                crate::credentials::save(&token, false);
+                self.login(token, false, cx);
+                return false;
+            }
+            Update::Cancelled => {
+                self.qr_step = QrStep::Ended("The login was declined on your phone.".into());
+                false
+            }
+            Update::Expired => {
+                self.qr_step = QrStep::Ended("The code expired.".into());
+                false
+            }
+            Update::Failed(reason) => {
+                self.qr_step = QrStep::Ended(reason);
+                false
+            }
+        };
+        cx.notify();
+        keep_going
+    }
+
+    pub fn stop_qr_login(&mut self, cx: &mut Context<Self>) {
+        self.qr_task = None;
+        self.qr_step = QrStep::Off;
+        cx.notify();
     }
 
     pub fn cancel_auth(&mut self, cx: &mut Context<Self>) {

@@ -8,6 +8,7 @@ pub mod model;
 pub mod onboarding;
 pub mod permissions;
 pub mod proto;
+pub mod remote_auth;
 pub mod rest;
 
 pub use model::*;

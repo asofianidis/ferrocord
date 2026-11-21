@@ -1,7 +1,7 @@
 use super::{theme, widgets::*};
 use crate::{
     credentials,
-    store::{AuthStep, Connection, Store},
+    store::{AuthStep, Connection, QrStep, Store},
 };
 use gpui::{prelude::*, *};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -9,8 +9,42 @@ use gpui_kit::assets::IconName;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
+    Qr,
     Password,
     Token,
+}
+
+/// Side length of the drawn QR code, in pixels (before rounding to whole modules).
+const QR_SIZE: f32 = 196.0;
+
+/// Draws `url` as a QR code: dark modules on white, with a quiet zone.
+fn qr_code(url: &str) -> AnyElement {
+    let Ok(code) = qrcode::QrCode::new(url) else {
+        return div().text_color(theme::danger()).child("Could not draw the code.").into_any_element();
+    };
+    let width = code.width();
+    let dark: Vec<bool> = code.to_colors().into_iter().map(|c| c == qrcode::Color::Dark).collect();
+    // Whole-pixel modules keep the edges crisp, which helps phone cameras.
+    let module = (QR_SIZE / width as f32).floor().max(1.0);
+    let side = module * width as f32;
+    div()
+        .p_3()
+        .rounded_lg()
+        .bg(gpui::white())
+        .child(
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, _| {
+                    for (i, _) in dark.iter().enumerate().filter(|(_, d)| **d) {
+                        let (x, y) = ((i % width) as f32, (i / width) as f32);
+                        let origin = point(bounds.origin.x + px(module * x), bounds.origin.y + px(module * y));
+                        window.paint_quad(fill(Bounds::new(origin, size(px(module), px(module))), gpui::black()));
+                    }
+                },
+            )
+            .size(px(side)),
+        )
+        .into_any_element()
 }
 
 pub struct LoginView {
@@ -39,14 +73,32 @@ impl LoginView {
             }));
         }
         let focus_code = code.clone();
-        subs.push(cx.observe_in(&store, window, move |_, store, window, cx| {
+        subs.push(cx.observe_in(&store, window, move |this, store, window, cx| {
             // Put the cursor in the code box when the second step appears.
             if matches!(store.read(cx).auth_step, AuthStep::Code { .. }) && !focus_code.read(cx).focus_handle(cx).is_focused(window) {
                 focus_code.update(cx, |s, cx| s.focus(window, cx));
             }
+            this.sync_qr(cx);
             cx.notify();
         }));
-        Self { store, mode: Mode::Password, login, password, code, token, is_bot: false, _subs: subs }
+        let this = cx.weak_entity();
+        cx.defer(move |cx| {
+            let _ = this.update(cx, |this, cx| this.sync_qr(cx));
+        });
+        Self { store, mode: Mode::Qr, login, password, code, token, is_bot: false, _subs: subs }
+    }
+
+    /// Runs a QR sign-in exactly while the QR tab is showing on the login screen.
+    fn sync_qr(&mut self, cx: &mut Context<Self>) {
+        let store = self.store.read(cx);
+        let on_login_screen = matches!(store.connection, Connection::LoggedOut | Connection::Failed(_));
+        let wanted = on_login_screen && self.mode == Mode::Qr;
+        let running = store.qr_step != QrStep::Off;
+        if wanted && !running {
+            self.store.update(cx, |s, cx| s.start_qr_login(cx));
+        } else if !wanted && running {
+            self.store.update(cx, |s, cx| s.stop_qr_login(cx));
+        }
     }
 
     fn value(input: &Entity<InputState>, cx: &App) -> String {
@@ -55,6 +107,7 @@ impl LoginView {
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.mode {
+            Mode::Qr => {}
             Mode::Token => self.submit_token(cx),
             Mode::Password => match self.store.read(cx).auth_step {
                 AuthStep::Working => {}
@@ -127,8 +180,46 @@ impl LoginView {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.mode = mode;
                 this.store.update(cx, |s, cx| s.cancel_auth(cx));
+                this.sync_qr(cx);
                 cx.notify();
             }))
+    }
+
+    fn render_qr(&self, cx: &mut Context<Self>) -> Div {
+        let step = self.store.read(cx).qr_step.clone();
+        let centered = v_flex().gap_3().items_center().py_2();
+        match step {
+            QrStep::Off | QrStep::Starting => centered
+                .child(div().size(px(QR_SIZE + 24.)).flex().items_center().justify_center().rounded_lg().bg(theme::bg_input()).child(
+                    div().text_color(theme::text_muted()).child("Preparing a code\u{2026}"),
+                ))
+                .child(div().text_size(px(13.)).text_color(theme::text_muted()).child(" ")),
+            QrStep::Code(url) => centered.child(qr_code(&url)).child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(theme::text_muted())
+                    .child("Open the Discord app on your phone, go to Settings and choose Scan QR Code."),
+            ),
+            QrStep::Scanned { username, avatar_url } => centered
+                .child(avatar(avatar_url.unwrap_or_default(), 72.))
+                .child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme::text_bright()).child("Check your phone"))
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(theme::text_muted())
+                        .child(format!("Approve the login for {username} in the Discord app.")),
+                )
+                .child(Self::link("qr-restart", "Not you? Get a new code").on_click(cx.listener(|this, _, _, cx| {
+                    this.store.update(cx, |s, cx| s.start_qr_login(cx));
+                }))),
+            QrStep::Ended(reason) => centered
+                .child(div().text_color(theme::text()).child(reason))
+                .child(
+                    Self::primary_button("qr-new", "Get a new code", false)
+                        .w(px(200.))
+                        .on_click(cx.listener(|this, _, _, cx| this.store.update(cx, |s, cx| s.start_qr_login(cx)))),
+                ),
+        }
     }
 
     fn render_password(&self, cx: &mut Context<Self>) -> Div {
@@ -219,10 +310,17 @@ impl Render for LoginView {
             _ => None,
         };
         let body = match self.mode {
+            Mode::Qr => self.render_qr(cx),
             Mode::Password => self.render_password(cx),
             Mode::Token => self.render_token(cx),
         };
         let note = match self.mode {
+            Mode::Qr => {
+                "You approve the login in Discord's own app, so no password or two-factor code is \
+                 needed here. Ferrocord keeps the session token in your operating system's \
+                 credential store. Using a personal account with a third-party client is against \
+                 Discord's terms of service."
+            }
             Mode::Password => {
                 "Your password goes only to Discord and is never saved; Ferrocord keeps the session \
                  token in your operating system's credential store. Using a personal account with a \
@@ -256,7 +354,8 @@ impl Render for LoginView {
                         .gap_1()
                         .rounded_lg()
                         .bg(theme::bg_input())
-                        .child(self.tab("mode-password", "Email and password", Mode::Password, cx))
+                        .child(self.tab("mode-qr", "QR code", Mode::Qr, cx))
+                        .child(self.tab("mode-password", "Password", Mode::Password, cx))
                         .child(self.tab("mode-token", "Token", Mode::Token, cx)),
                 )
                 .child(body)
