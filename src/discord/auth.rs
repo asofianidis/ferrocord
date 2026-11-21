@@ -84,6 +84,8 @@ pub fn describe_error(v: &Value, status: u16) -> String {
 pub struct Auth {
     http: reqwest::Client,
     fingerprint: parking_lot::Mutex<Option<String>>,
+    /// Identifies this login attempt; Discord's client echoes it with the code.
+    login_instance: parking_lot::Mutex<Option<String>>,
 }
 
 impl Auth {
@@ -94,7 +96,7 @@ impl Auth {
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(30))
             .build()?;
-        Ok(Self { http, fingerprint: parking_lot::Mutex::new(None) })
+        Ok(Self { http, fingerprint: parking_lot::Mutex::new(None), login_instance: parking_lot::Mutex::new(None) })
     }
 
     /// Asks Discord for a device fingerprint (it also sets the session
@@ -134,12 +136,35 @@ impl Auth {
             "login": login, "password": password, "undelete": false,
             "login_source": null, "gift_code_sku_id": null,
         });
-        parse_login(&self.post("/auth/login", body).await?)
+        let reply = self.post("/auth/login", body).await?;
+        *self.login_instance.lock() = reply["login_instance_id"].as_str().map(str::to_string);
+        let outcome = parse_login(&reply)?;
+        if matches!(outcome, Outcome::Mfa(_)) {
+            // Field names only, never values: enough to see what Discord expects next.
+            let keys: Vec<&str> = reply.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
+            log::warn!("two-factor needed; Discord's reply had the fields {keys:?}");
+        }
+        Ok(outcome)
+    }
+
+    /// The body of a two-factor request, echoing this attempt's identifiers.
+    fn code_body(&self, ticket: &str, code: &str) -> Value {
+        let mut body = json!({ "code": code, "ticket": ticket, "login_source": null, "gift_code_sku_id": null });
+        if let Some(id) = self.login_instance.lock().clone() {
+            body["login_instance_id"] = json!(id);
+        }
+        log::warn!(
+            "sending a {}-character {} two-factor code{}",
+            code.len(),
+            if code.chars().all(|c| c.is_ascii_digit()) { "numeric" } else { "non-numeric" },
+            if body.get("login_instance_id").is_some() { " with the login instance id" } else { "" },
+        );
+        body
     }
 
     /// Finishes with an authenticator code or a backup code.
     pub async fn totp(&self, ticket: &str, code: &str) -> Result<String> {
-        let body = json!({ "code": code, "ticket": ticket, "login_source": null, "gift_code_sku_id": null });
+        let body = self.code_body(ticket, code);
         token_of(&self.post("/auth/mfa/totp", body).await?)
     }
 
@@ -150,7 +175,7 @@ impl Auth {
     }
 
     pub async fn sms(&self, ticket: &str, code: &str) -> Result<String> {
-        let body = json!({ "code": code, "ticket": ticket, "login_source": null, "gift_code_sku_id": null });
+        let body = self.code_body(ticket, code);
         token_of(&self.post("/auth/mfa/sms", body).await?)
     }
 }

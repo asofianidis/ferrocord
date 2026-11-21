@@ -424,7 +424,8 @@ impl Store {
     /// Sends the two-factor code: an authenticator or backup code, or the texted code.
     pub fn submit_auth_code(&mut self, code: String, cx: &mut Context<Self>) {
         let AuthStep::Code { ticket, texted_to, .. } = self.auth_step.clone() else { return };
-        let code: String = code.chars().filter(|c| !c.is_whitespace() && *c != '-').collect();
+        // Codes are letters and digits only; drop spaces, dashes and anything invisible.
+        let code: String = code.chars().filter(char::is_ascii_alphanumeric).collect();
         if code.is_empty() {
             return;
         }
