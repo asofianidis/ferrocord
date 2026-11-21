@@ -374,3 +374,7 @@ features = [
     "rt-multi-thread",
     "test-util",
 ]
+
+# ferrocord: songbird's own warnings (also present upstream) are not ours to fix.
+[lints.rust]
+unused = "allow"
