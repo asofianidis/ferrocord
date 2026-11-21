@@ -16,6 +16,11 @@ pub struct Settings {
     pub input_sensitivity_db: f32,
     /// Closing the window keeps the app running in the system tray (Windows).
     pub close_to_tray: bool,
+    /// Linear gains for the microphone and for voice playback (1.0 = 100%).
+    pub input_volume: f32,
+    pub output_volume: f32,
+    /// Play sounds when joining, leaving, muting and deafening.
+    pub voice_sounds: bool,
 }
 
 impl Default for Settings {
@@ -27,6 +32,9 @@ impl Default for Settings {
             output_device: None,
             input_sensitivity_db: -50.0,
             close_to_tray: true,
+            input_volume: 1.0,
+            output_volume: 1.0,
+            voice_sounds: true,
         }
     }
 }
@@ -45,6 +53,8 @@ impl Settings {
             input_device: self.input_device.clone(),
             output_device: self.output_device.clone(),
             sensitivity_db: self.input_sensitivity_db,
+            input_volume: self.input_volume,
+            output_volume: self.output_volume,
         }
     }
 

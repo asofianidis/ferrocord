@@ -12,6 +12,7 @@ use crate::{
     store::{Profile, Store, StoreEvent, image_mime},
 };
 use gpui::{prelude::*, *};
+use gpui_component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::assets::IconName;
 
 pub enum SettingsEvent {
@@ -24,10 +25,17 @@ pub struct SettingsView {
     saved: settings::Settings,
     /// Audio devices, listed in the background when the dialog opens.
     devices: Option<crate::voice::Devices>,
+    input_volume: Entity<SliderState>,
+    output_volume: Entity<SliderState>,
+    sensitivity: Entity<SliderState>,
+    /// Listens to the microphone while settings are open, for the level meter.
+    mic_test: Option<crate::voice::MicTest>,
+    mic_problem: Option<String>,
+    _subs: Vec<Subscription>,
 }
 
-const SENSITIVITY: [(&str, f32); 4] =
-    [("Very sensitive", -60.0), ("Sensitive", -50.0), ("Normal", -40.0), ("Only loud speech", -30.0)];
+/// The sensitivity slider and level meter span this range, in dBFS.
+const METER_FLOOR_DB: f32 = -80.0;
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
 
@@ -43,12 +51,129 @@ impl SettingsView {
             });
         })
         .detach();
-        Self {
+        let saved = settings::Settings::load();
+        let mut percent = |v: f32| cx.new(|_| SliderState::new().min(0.).max(200.).step(1.).default_value((v * 100.).round()));
+        let input_volume = percent(saved.input_volume);
+        let output_volume = percent(saved.output_volume);
+        let sensitivity = cx.new(|_| {
+            SliderState::new().min(METER_FLOOR_DB).max(0.).step(1.).default_value(saved.input_sensitivity_db.clamp(METER_FLOOR_DB, 0.))
+        });
+        let subs = vec![
+            cx.subscribe(&input_volume, |this, _, event: &SliderEvent, cx| {
+                let (value, done) = slider_value(event);
+                let volume = value / 100.;
+                this.saved.input_volume = volume;
+                this.store.update(cx, |s, _| s.set_input_volume(volume));
+                if let Some(test) = &this.mic_test {
+                    test.set_volume(volume);
+                }
+                if done {
+                    settings::Settings::update(|s| s.input_volume = volume);
+                }
+                cx.notify();
+            }),
+            cx.subscribe(&output_volume, |this, _, event: &SliderEvent, cx| {
+                let (value, done) = slider_value(event);
+                let volume = value / 100.;
+                this.saved.output_volume = volume;
+                this.store.update(cx, |s, _| s.set_output_volume(volume));
+                if done {
+                    settings::Settings::update(|s| s.output_volume = volume);
+                }
+                cx.notify();
+            }),
+            cx.subscribe(&sensitivity, |this, _, event: &SliderEvent, cx| {
+                let (db, done) = slider_value(event);
+                this.saved.input_sensitivity_db = db;
+                this.store.update(cx, |s, _| s.set_input_sensitivity(db));
+                if done {
+                    settings::Settings::update(|s| s.input_sensitivity_db = db);
+                }
+                cx.notify();
+            }),
+        ];
+        // Redraw the level meter while the dialog is open.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(50)).await;
+                let alive = this.update(cx, |this, cx| {
+                    if this.mic_test.is_some() {
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        let mut view = Self {
             store,
             themes: theme::load_all(settings::themes_dir().as_deref()),
-            saved: settings::Settings::load(),
+            saved,
             devices: None,
+            input_volume,
+            output_volume,
+            sensitivity,
+            mic_test: None,
+            mic_problem: None,
+            _subs: subs,
+        };
+        view.restart_mic_test();
+        view
+    }
+
+    fn restart_mic_test(&mut self) {
+        self.mic_test = None;
+        match crate::voice::MicTest::start(self.saved.input_device.as_deref(), self.saved.input_volume) {
+            Ok(test) => {
+                self.mic_test = Some(test);
+                self.mic_problem = None;
+            }
+            Err(problem) => self.mic_problem = Some(problem),
         }
+    }
+
+    fn label_row(label: &'static str, value: String) -> Div {
+        h_flex()
+            .text_size(px(12.))
+            .text_color(theme::text_muted())
+            .child(div().flex_1().child(label))
+            .child(div().text_color(theme::text()).child(value))
+    }
+
+    fn slider(state: &Entity<SliderState>) -> Slider {
+        Slider::new(state).bg(theme::accent()).text_color(theme::text_bright())
+    }
+
+    /// The microphone's live level, with the part above the sensitivity
+    /// threshold (what would be sent) in green.
+    fn level_meter(&self) -> AnyElement {
+        let Some(test) = &self.mic_test else {
+            let note = self.mic_problem.clone().unwrap_or_else(|| "Starting the microphone\u{2026}".into());
+            return div().text_size(px(12.)).text_color(theme::text_muted()).child(note).into_any_element();
+        };
+        let span = -METER_FLOOR_DB;
+        let level = ((test.level_db() - METER_FLOOR_DB) / span).clamp(0., 1.);
+        let threshold = ((self.saved.input_sensitivity_db - METER_FLOOR_DB) / span).clamp(0., 1.);
+        let fill_color = if level >= threshold { theme::online() } else { theme::warning() };
+        let (track, marker) = (theme::bg_active(), theme::text_bright());
+        let meter = canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                let width = bounds.size.width;
+                let height = bounds.size.height;
+                window.paint_quad(fill(bounds, track).corner_radii(height / 2.));
+                if level > 0. {
+                    let filled = Bounds::new(bounds.origin, size(width * level, height));
+                    window.paint_quad(fill(filled, fill_color).corner_radii(height / 2.));
+                }
+                let x = bounds.origin.x + width * threshold - px(1.);
+                window.paint_quad(fill(Bounds::new(point(x, bounds.origin.y), size(px(2.), height)), marker));
+            },
+        )
+        .size_full();
+        div().w_full().h(px(8.)).flex_shrink_0().rounded_full().bg(theme::bg_active()).child(meter).into_any_element()
     }
 
     fn choose(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -63,6 +188,7 @@ impl SettingsView {
     fn set_device(&mut self, input: bool, name: Option<String>, cx: &mut Context<Self>) {
         if input {
             self.saved.input_device = name.clone();
+            self.restart_mic_test();
         } else {
             self.saved.output_device = name.clone();
         }
@@ -255,6 +381,14 @@ impl SettingsView {
     }
 }
 
+/// A slider event's value, and whether the user has let go (time to save).
+fn slider_value(event: &SliderEvent) -> (f32, bool) {
+    match event {
+        SliderEvent::Change(v) => (v.start(), false),
+        SliderEvent::Release(v) => (v.start(), true),
+    }
+}
+
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
@@ -369,18 +503,31 @@ impl Render for SettingsView {
                     .child(self.device_list(true, cx))
                     .child(div().text_size(px(12.)).text_color(theme::text_muted()).child("Output"))
                     .child(self.device_list(false, cx))
-                    .child(div().text_size(px(12.)).text_color(theme::text_muted()).child("Input sensitivity"))
-                    .child(h_flex().flex_wrap().gap_2().children(SENSITIVITY.into_iter().enumerate().map(
-                        |(ix, (label, db))| {
-                            let selected = (self.saved.input_sensitivity_db - db).abs() < 0.5;
-                            Self::pill(("sensitivity", ix), label, selected).on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.saved.input_sensitivity_db = db;
-                                    settings::Settings::update(|s| s.input_sensitivity_db = db);
-                                    this.store.update(cx, |store, _| store.set_input_sensitivity(db));
+                    .child(Self::label_row("Input volume", format!("{:.0}%", self.saved.input_volume * 100.)))
+                    .child(Self::slider(&self.input_volume))
+                    .child(Self::label_row(
+                        "Input sensitivity",
+                        format!("{:.0} dB", self.saved.input_sensitivity_db),
+                    ))
+                    .child(self.level_meter())
+                    .child(Self::slider(&self.sensitivity))
+                    .child(div().text_size(px(12.)).text_color(theme::text_muted()).child(
+                        "Speak normally: your voice is sent while the bar is green. Move the slider right if \
+                         background noise turns it green, left if your voice does not.",
+                    ))
+                    .child(Self::label_row("Output volume", format!("{:.0}%", self.saved.output_volume * 100.)))
+                    .child(Self::slider(&self.output_volume))
+                    .child(h_flex().gap_2().pt_1().children([(true, "Play voice sounds"), (false, "No voice sounds")].into_iter().map(
+                        |(value, label)| {
+                            Self::pill(SharedString::from(format!("sounds-{value}")), label, self.saved.voice_sounds == value)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.saved.voice_sounds = value;
+                                    settings::Settings::update(|s| s.voice_sounds = value);
+                                    if value {
+                                        crate::sounds::play(crate::sounds::Sound::Join);
+                                    }
                                     cx.notify();
-                                },
-                            ))
+                                }))
                         },
                     )))
                     .when(cfg!(windows), |d| {

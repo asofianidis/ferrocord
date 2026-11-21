@@ -6,6 +6,7 @@ mod emoji;
 mod http;
 mod markdown;
 mod settings;
+mod sounds;
 mod store;
 mod tray;
 mod voice;

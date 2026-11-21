@@ -60,6 +60,88 @@ pub struct VoiceOptions {
     pub output_device: Option<String>,
     /// Voice activity threshold in dBFS; quieter input is not sent.
     pub sensitivity_db: f32,
+    /// Linear gains: 1.0 leaves the audio as it is.
+    pub input_volume: f32,
+    pub output_volume: f32,
+}
+
+/// Loudness in dBFS of samples' RMS, floored at -100.
+pub fn rms_db(samples: &[f32]) -> f32 {
+    let rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len().max(1) as f32).sqrt();
+    (20.0 * rms.max(1e-5).log10()).max(-100.0)
+}
+
+/// Captures the microphone only to measure how loud it is, for the level
+/// meter in settings. Drop it to close the device.
+pub struct MicTest {
+    _stream: cpal::Stream,
+    level: Arc<AtomicU32>,
+    gain: Arc<AtomicU32>,
+}
+
+impl MicTest {
+    pub fn start(device: Option<&str>, volume: f32) -> Result<Self, String> {
+        let host = cpal::default_host();
+        let device = host
+            .input_devices()
+            .ok()
+            .and_then(|list| pick_device(list, device))
+            .or_else(|| host.default_input_device())
+            .ok_or("No microphone was found.")?;
+        let config = device.default_input_config().map_err(|e| format!("Microphone unavailable: {e}"))?;
+        let channels = config.channels() as usize;
+        let level = Arc::new(AtomicU32::new((-100f32).to_bits()));
+        let gain = Arc::new(AtomicU32::new(volume.to_bits()));
+
+        fn build<T>(
+            device: &cpal::Device,
+            config: &cpal::StreamConfig,
+            channels: usize,
+            level: Arc<AtomicU32>,
+            gain: Arc<AtomicU32>,
+        ) -> Result<cpal::Stream, cpal::BuildStreamError>
+        where
+            T: SizedSample,
+            f32: FromSample<T>,
+        {
+            let mut mono = Vec::new();
+            device.build_input_stream(
+                config,
+                move |data: &[T], _| {
+                    let g = f32::from_bits(gain.load(Ordering::Relaxed));
+                    mono.clear();
+                    mono.extend(data.chunks(channels.max(1)).map(|frame| {
+                        g * frame.iter().map(|s| f32::from_sample(*s)).sum::<f32>() / frame.len() as f32
+                    }));
+                    level.store(rms_db(&mono).to_bits(), Ordering::Relaxed);
+                },
+                |e| log::warn!("microphone test error: {e}"),
+                None,
+            )
+        }
+
+        let stream_config = config.config();
+        let (l, g) = (level.clone(), gain.clone());
+        let stream = match config.sample_format() {
+            cpal::SampleFormat::F32 => build::<f32>(&device, &stream_config, channels, l, g),
+            cpal::SampleFormat::I16 => build::<i16>(&device, &stream_config, channels, l, g),
+            cpal::SampleFormat::U16 => build::<u16>(&device, &stream_config, channels, l, g),
+            cpal::SampleFormat::I32 => build::<i32>(&device, &stream_config, channels, l, g),
+            other => return Err(format!("Unsupported microphone format {other:?}.")),
+        }
+        .map_err(|e| format!("Could not open the microphone: {e}"))?;
+        stream.play().map_err(|e| format!("Could not start the microphone: {e}"))?;
+        Ok(Self { _stream: stream, level, gain })
+    }
+
+    /// The latest loudness, in dBFS.
+    pub fn level_db(&self) -> f32 {
+        f32::from_bits(self.level.load(Ordering::Relaxed))
+    }
+
+    pub fn set_volume(&self, volume: f32) {
+        self.gain.store(volume.to_bits(), Ordering::Relaxed);
+    }
 }
 
 /// Where to connect, as told by `VOICE_STATE_UPDATE` and `VOICE_SERVER_UPDATE`.
@@ -316,6 +398,9 @@ struct Shared {
     deafened: AtomicBool,
     /// Linear RMS threshold, stored as f32 bits.
     threshold: AtomicU32,
+    /// Linear microphone and playback gains, stored as f32 bits.
+    input_gain: AtomicU32,
+    output_gain: AtomicU32,
     /// When the microphone last heard something above the threshold.
     last_loud: Mutex<Option<Instant>>,
     has_mic: AtomicBool,
@@ -524,9 +609,10 @@ fn open_input(shared: Arc<Shared>, wanted: Option<&str>) -> Result<(cpal::Stream
         device.build_input_stream(
             config,
             move |data: &[T], _| {
+                let gain = f32::from_bits(shared.input_gain.load(Ordering::Relaxed));
                 mono.clear();
                 mono.extend(data.chunks(channels.max(1)).map(|frame| {
-                    frame.iter().map(|s| f32::from_sample(*s)).sum::<f32>() / frame.len() as f32
+                    (gain * frame.iter().map(|s| f32::from_sample(*s)).sum::<f32>() / frame.len() as f32).clamp(-1.0, 1.0)
                 }));
                 let rms = (mono.iter().map(|s| s * s).sum::<f32>() / mono.len().max(1) as f32).sqrt();
                 let loud = rms >= shared.threshold();
@@ -582,6 +668,12 @@ fn open_output(shared: Arc<Shared>, wanted: Option<&str>) -> Result<(cpal::Strea
                 let frames = data.len() / channels.max(1);
                 stereo.resize(frames * 2, 0.0);
                 shared.out.lock().pull(&mut stereo);
+                let gain = f32::from_bits(shared.output_gain.load(Ordering::Relaxed));
+                if gain != 1.0 {
+                    for s in stereo.iter_mut() {
+                        *s = (*s * gain).clamp(-1.0, 1.0);
+                    }
+                }
                 for (frame, lr) in data.chunks_mut(channels.max(1)).zip(stereo.chunks(2)) {
                     for (ch, slot) in frame.iter_mut().enumerate() {
                         let value = match (channels, ch) {
@@ -644,6 +736,8 @@ impl VoiceConnection {
             muted: AtomicBool::new(muted),
             deafened: AtomicBool::new(deafened),
             threshold: AtomicU32::new(db_to_linear(options.sensitivity_db).to_bits()),
+            input_gain: AtomicU32::new(options.input_volume.to_bits()),
+            output_gain: AtomicU32::new(options.output_volume.to_bits()),
             last_loud: Mutex::new(None),
             has_mic: AtomicBool::new(false),
             ssrc_users: Mutex::new(HashMap::new()),
@@ -740,6 +834,14 @@ impl VoiceConnection {
 
     pub fn set_sensitivity(&self, db: f32) {
         self.shared.threshold.store(db_to_linear(db).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn set_input_volume(&self, volume: f32) {
+        self.shared.input_gain.store(volume.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn set_output_volume(&self, volume: f32) {
+        self.shared.output_gain.store(volume.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -915,6 +1017,8 @@ mod tests {
             muted: AtomicBool::new(false),
             deafened: AtomicBool::new(false),
             threshold: AtomicU32::new(0f32.to_bits()),
+            input_gain: AtomicU32::new(1f32.to_bits()),
+            output_gain: AtomicU32::new(1f32.to_bits()),
             last_loud: Mutex::new(loud.then(Instant::now)),
             has_mic: AtomicBool::new(true),
             ssrc_users: Mutex::new(HashMap::new()),
@@ -958,6 +1062,14 @@ mod tests {
         let mut source = MicSource::new(test_shared(false), 1000);
         let got = read_samples(&mut source, 4096);
         assert_eq!(got, vec![0.0; 10], "10 ms of silence");
+    }
+
+    #[test]
+    fn rms_in_decibels() {
+        assert!((rms_db(&[1.0, -1.0]) - 0.0).abs() < 1e-4);
+        assert!((rms_db(&[0.1; 8]) + 20.0).abs() < 1e-3);
+        assert_eq!(rms_db(&[0.0; 8]), -100.0);
+        assert_eq!(rms_db(&[]), -100.0);
     }
 
     #[test]

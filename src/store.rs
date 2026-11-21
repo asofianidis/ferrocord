@@ -2129,6 +2129,17 @@ impl Store {
         if state.guild_id.is_none() {
             state.guild_id = state.channel_id.and_then(|c| self.channels.get(&c)).and_then(|c| c.guild_id);
         }
+        // Chime when someone else comes into or leaves the channel we are in.
+        let ours = self.voice_session.as_ref().filter(|s| s.status == VoiceStatus::Connected).map(|s| s.channel);
+        if let Some(ours) = ours.filter(|_| state.user_id != self.my_id()) {
+            let was_here = self.voice.get(&ours).is_some_and(|m| m.iter().any(|m| m.user == state.user_id));
+            let is_here = state.channel_id == Some(ours);
+            if is_here && !was_here {
+                crate::sounds::play(crate::sounds::Sound::OtherJoin);
+            } else if was_here && !is_here {
+                crate::sounds::play(crate::sounds::Sound::OtherLeave);
+            }
+        }
         self.track_voice_state(&state);
         if state.user_id == self.my_id() {
             if let Some(session) = self.voice_session.as_mut() {
@@ -2140,6 +2151,7 @@ impl Store {
                         self.try_connect_voice(cx);
                     }
                     None if session.status != VoiceStatus::Joining => {
+                        crate::sounds::play(crate::sounds::Sound::Leave);
                         self.end_voice(cx);
                         cx.emit(StoreEvent::Notice("You were disconnected from voice.".into()));
                     }
@@ -2210,6 +2222,10 @@ impl Store {
         match event {
             VoiceEvent::Connected => {
                 if let Some(session) = self.voice_session.as_mut() {
+                    // Reconnects report Connected again; chime only on the first.
+                    if session.status != VoiceStatus::Connected {
+                        crate::sounds::play(crate::sounds::Sound::Join);
+                    }
                     session.status = VoiceStatus::Connected;
                 }
             }
@@ -2265,6 +2281,7 @@ impl Store {
             if let Some(session) = self.voice_session.as_mut() {
                 session.status = VoiceStatus::Connected;
             }
+            crate::sounds::play(crate::sounds::Sound::Join);
             // Sample conversation: someone is already talking.
             self.speaking.insert(if is_stage { Id(4) } else { Id(2) });
         } else {
@@ -2306,6 +2323,7 @@ impl Store {
 
     pub fn leave_voice(&mut self, cx: &mut Context<Self>) {
         let Some(session) = self.voice_session.as_ref() else { return };
+        crate::sounds::play(crate::sounds::Sound::Leave);
         if !self.demo {
             self.send_voice_state(None, session.guild);
         }
@@ -2335,23 +2353,43 @@ impl Store {
     }
 
     pub fn toggle_self_mute(&mut self, cx: &mut Context<Self>) {
+        let was_deaf = self.self_deaf;
         self.self_mute = !self.self_mute;
         // Unmuting while deafened also undeafens, as in Discord.
         if !self.self_mute {
             self.self_deaf = false;
         }
+        use crate::sounds::{Sound, play};
+        play(match (self.self_mute, was_deaf && !self.self_deaf) {
+            (_, true) => Sound::Undeafen,
+            (true, _) => Sound::Mute,
+            (false, _) => Sound::Unmute,
+        });
         self.announce_self_state(cx);
     }
 
     pub fn toggle_self_deaf(&mut self, cx: &mut Context<Self>) {
         self.self_deaf = !self.self_deaf;
         self.self_mute = self.self_deaf;
+        crate::sounds::play(if self.self_deaf { crate::sounds::Sound::Deafen } else { crate::sounds::Sound::Undeafen });
         self.announce_self_state(cx);
     }
 
     pub fn set_input_sensitivity(&mut self, db: f32) {
         if let Some(conn) = &self.voice_conn {
             conn.set_sensitivity(db);
+        }
+    }
+
+    pub fn set_input_volume(&mut self, volume: f32) {
+        if let Some(conn) = &self.voice_conn {
+            conn.set_input_volume(volume);
+        }
+    }
+
+    pub fn set_output_volume(&mut self, volume: f32) {
+        if let Some(conn) = &self.voice_conn {
+            conn.set_output_volume(volume);
         }
     }
 
