@@ -124,7 +124,8 @@ pub struct ChatView {
     completion: Option<Completion>,
     /// Friendly text inserted by autocomplete, with what to send instead.
     replacements: Vec<(String, String)>,
-    profile: Option<Id>,
+    /// The open profile card: whose, and where it was asked for (window coordinates).
+    profile: Option<ProfileCard>,
     flash: Option<Id>,
     post_title: Entity<InputState>,
     post_body: Entity<InputState>,
@@ -1220,7 +1221,14 @@ impl ChatView {
             }))
     }
 
-    fn render_profile(&self, user_id: Id, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Opens a user's profile card beside the point that was clicked.
+    pub fn show_profile(&mut self, user: Id, at: Point<Pixels>, side: Anchor, cx: &mut Context<Self>) {
+        self.profile = Some(ProfileCard { user, at, side });
+        cx.notify();
+    }
+
+    fn render_profile(&self, card_at: ProfileCard, cx: &mut Context<Self>) -> impl IntoElement {
+        let user_id = card_at.user;
         let store = self.store.read(cx);
         let guild_id = self.channel.and_then(|c| store.channels.get(&c)).and_then(|c| c.guild_id);
         let user = store.users.get(&user_id).cloned().unwrap_or_default();
@@ -1254,21 +1262,21 @@ impl ChatView {
                 .child(label)
         };
 
-        div()
-            .id("profile-backdrop")
-            .absolute()
-            .inset_0()
-            .occlude()
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.profile = None;
-                cx.notify();
-            }))
-            .child(
+        // A small gap between the click and the card, on the side it opens towards.
+        let gap = px(12.);
+        let offset = match card_at.side {
+            Anchor::TopRight | Anchor::BottomRight => point(-gap, px(0.)),
+            _ => point(gap, px(0.)),
+        };
+        deferred(
+            anchored()
+                .anchor(card_at.side)
+                .position(card_at.at + offset)
+                .snap_to_window_with_margin(px(8.))
+                .child(
                 v_flex()
                     .id("profile")
-                    .absolute()
-                    .top(px(72.))
-                    .left(px(72.))
+                    .occlude()
                     .w(px(320.))
                     .rounded_xl()
                     .overflow_hidden()
@@ -1276,7 +1284,10 @@ impl ChatView {
                     .border_color(theme::border())
                     .bg(theme::bg_sidebar())
                     .shadow_lg()
-                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.profile = None;
+                        cx.notify();
+                    }))
                     .child(div().h(px(56.)).w_full().bg(theme::accent()))
                     .child(
                         v_flex()
@@ -1342,7 +1353,9 @@ impl ChatView {
                                     })),
                             ),
                     ),
-            )
+                ),
+        )
+        .with_priority(1)
     }
 
     // ------------------------------------------------------------ rows
@@ -1451,11 +1464,9 @@ impl ChatView {
         let author_id = m.author.id;
         let show_profile = {
             let this = this.clone();
-            move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
-                this.update(cx, |this, cx| {
-                    this.profile = Some(author_id);
-                    cx.notify();
-                });
+            move |event: &ClickEvent, _: &mut Window, cx: &mut App| {
+                let at = event.position();
+                this.update(cx, |this, cx| this.show_profile(author_id, at, Anchor::TopLeft, cx));
             }
         };
         let revealed = self.revealed.contains(&id);
@@ -2213,11 +2224,8 @@ impl Render for ChatView {
         let has_channel = self.channel.is_some();
         let call_panel = self.channel.and_then(|channel| {
             let view = this.clone();
-            let on_profile: call::OnProfile = Rc::new(move |user, cx| {
-                view.update(cx, |this, cx| {
-                    this.profile = Some(user);
-                    cx.notify();
-                });
+            let on_profile: call::OnProfile = Rc::new(move |user, at, cx| {
+                view.update(cx, |this, cx| this.show_profile(user, at, Anchor::TopLeft, cx));
             });
             call::call_panel(&self.store, channel, &self.stage_topic, on_profile, cx)
         });
@@ -2302,8 +2310,17 @@ impl Render for ChatView {
             .when_some(self.completion.as_ref(), |d, completion| d.child(self.render_completion(completion, cx)))
             .when(picker_open, |d| d.child(self.render_picker(cx)))
             .when_some(panel, |d, panel| d.child(self.render_panel(&panel, cx)))
-            .when_some(profile, |d, user| d.child(self.render_profile(user, cx)))
+            .when_some(profile, |d, card| d.child(self.render_profile(card, cx)))
     }
+}
+
+#[derive(Clone, Copy)]
+pub struct ProfileCard {
+    user: Id,
+    at: Point<Pixels>,
+    /// Which corner of the card sits at the click: top-left opens it to the
+    /// right, top-right to the left (as from the member list).
+    side: Anchor,
 }
 
 // ---------------------------------------------------------------- helpers

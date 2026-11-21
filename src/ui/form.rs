@@ -271,6 +271,11 @@ pub fn open_server_settings(guild: crate::discord::Id, window: &mut Window, cx: 
     with_app(cx, |app, cx| app.show_server_settings(guild, window, cx));
 }
 
+/// Opens a member's profile card to the left of `at` (used by the member list).
+pub fn open_profile(user: crate::discord::Id, at: Point<Pixels>, cx: &mut App) {
+    with_app(cx, |app, cx| app.show_profile(user, at, cx));
+}
+
 pub fn open_events(guild: crate::discord::Id, cx: &mut App) {
     with_app(cx, |app, cx| app.show_events(guild, cx));
 }

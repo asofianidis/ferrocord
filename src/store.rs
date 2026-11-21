@@ -203,7 +203,11 @@ pub struct Store {
     pub presences: HashMap<Id, Status>,
     pub typing: HashMap<Id, Vec<TypingUser>>,
     pub member_info: HashMap<(Id, Id), MemberInfo>,
-    pub member_lists: HashMap<Id, Vec<MemberRow>>,
+    /// Member lists by server and Discord's list id. Channels with the same
+    /// audience share a list ("everyone" for public channels).
+    member_lists: HashMap<(Id, String), Vec<MemberRow>>,
+    /// Which list each channel (or a thread's parent) shows.
+    channel_lists: HashMap<Id, String>,
     pub collapsed: std::collections::HashSet<Id>,
     pub show_members: bool,
     /// Who is connected to each voice channel (or direct-message call).
@@ -253,6 +257,9 @@ pub struct Store {
 }
 
 impl EventEmitter<StoreEvent> for Store {}
+
+/// The list id used for the server-wide list bot accounts receive.
+const BOT_LIST: &str = "bot";
 
 pub struct AuditLog {
     pub entries: Vec<discord::audit::AuditEntry>,
@@ -341,6 +348,7 @@ impl Store {
             typing: HashMap::new(),
             member_info: HashMap::new(),
             member_lists: HashMap::new(),
+            channel_lists: HashMap::new(),
             collapsed: Default::default(),
             show_members: true,
             voice: HashMap::new(),
@@ -921,12 +929,33 @@ impl Store {
         self.mark_read(channel, cx);
 
         if let Some(guild) = guild {
-            if self.subscribed != Some((guild, channel)) {
-                self.subscribed = Some((guild, channel));
+            let list_channel = self.member_list_channel(channel);
+            if self.subscribed != Some((guild, list_channel)) {
+                self.subscribed = Some((guild, list_channel));
                 if let Some(commands) = &self.commands {
-                    let _ = commands.send(Command::SubscribeMembers { guild_id: guild, channel_id: channel });
+                    let _ = commands.send(Command::SubscribeMembers { guild_id: guild, channel_id: list_channel });
                 }
             }
+        }
+    }
+
+    /// The channel whose member list a channel shows: threads and forum
+    /// posts use their parent, since Discord serves lists per channel.
+    fn member_list_channel(&self, channel: Id) -> Id {
+        match self.channels.get(&channel) {
+            Some(c) if c.is_thread() => c.parent_id.unwrap_or(channel),
+            _ => channel,
+        }
+    }
+
+    /// The member list for the selected channel, if it has arrived.
+    pub fn member_rows(&self) -> Option<&Vec<MemberRow>> {
+        let guild = self.selected_guild?;
+        let channel = self.member_list_channel(self.selected_channel?);
+        match self.channel_lists.get(&channel) {
+            Some(list) => self.member_lists.get(&(guild, list.clone())),
+            // Bot accounts get one list for the whole server.
+            None => self.member_lists.get(&(guild, BOT_LIST.to_string())),
         }
     }
 
@@ -1391,7 +1420,7 @@ impl Store {
             }
         }
         let infos = &self.member_info;
-        if let Some(rows) = self.member_lists.get_mut(&guild) {
+        for rows in self.member_lists.iter_mut().filter(|((g, _), _)| *g == guild).map(|(_, rows)| rows) {
             for row in rows.iter_mut() {
                 if let MemberRow::Member { user, color, nick, .. } = row {
                     if let Some(info) = infos.get(&(guild, user.id)) {
@@ -3606,8 +3635,10 @@ impl Store {
                 cx.emit(StoreEvent::Members(guild_id));
             }
             Event::MemberRemove { guild_id, user_id } => {
-                if let Some(rows) = self.member_lists.get_mut(&guild_id) {
-                    rows.retain(|row| !matches!(row, MemberRow::Member { user, .. } if user.id == user_id));
+                for ((g, _), rows) in self.member_lists.iter_mut() {
+                    if *g == guild_id {
+                        rows.retain(|row| !matches!(row, MemberRow::Member { user, .. } if user.id == user_id));
+                    }
                 }
                 self.member_info.remove(&(guild_id, user_id));
                 cx.emit(StoreEvent::Members(guild_id));
@@ -3679,7 +3710,7 @@ impl Store {
                     _ => String::new(),
                 });
                 rows.insert(0, MemberRow::Group { name: "Members".into(), count: rows.len() as u32 });
-                self.member_lists.insert(guild_id, rows);
+                self.member_lists.insert((guild_id, BOT_LIST.to_string()), rows);
                 cx.emit(StoreEvent::Members(guild_id));
             }
         }
@@ -3692,6 +3723,7 @@ impl Store {
         self.dms.clear();
         self.read.clear();
         self.member_lists.clear();
+        self.channel_lists.clear();
         self.voice.clear();
         self.stages.clear();
         self.calls.clear();
@@ -3776,7 +3808,17 @@ impl Store {
                 })
                 .unwrap_or_else(|| other.to_string()),
         };
-        let mut rows = self.member_lists.remove(&guild_id).unwrap_or_default();
+        let list_id = v["id"].as_str().unwrap_or("everyone").to_string();
+        let key = (guild_id, list_id.clone());
+        let mut rows = self.member_lists.remove(&key).unwrap_or_default();
+        let synced = v["ops"].as_array().into_iter().flatten().any(|op| op["op"] == "SYNC");
+        if synced {
+            // Lists are only synced for the channel just subscribed to.
+            if let Some((g, channel)) = self.subscribed.filter(|(g, _)| *g == guild_id) {
+                log::debug!("member list {list_id} of {g} belongs to channel {channel}");
+                self.channel_lists.insert(channel, list_id.clone());
+            }
+        }
 
         let parse_item = |store: &mut Store, item: &serde_json::Value| -> MemberRow {
             if let Some(group) = item.get("group") {
@@ -3848,7 +3890,7 @@ impl Store {
                 }
             }
         }
-        self.member_lists.insert(guild_id, rows);
+        self.member_lists.insert(key, rows);
         cx.emit(StoreEvent::Members(guild_id));
     }
 }

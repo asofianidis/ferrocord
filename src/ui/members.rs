@@ -13,6 +13,9 @@ use crate::{
 use gpui::{prelude::*, *};
 use std::ops::Range;
 
+/// Width of the member list, which is always at the window's right edge.
+const PANEL_WIDTH: f32 = 240.;
+
 pub struct Members {
     store: Entity<Store>,
     _subs: Vec<Subscription>,
@@ -31,7 +34,7 @@ impl Members {
     fn rows(&mut self, range: Range<usize>, _: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let store = self.store.read(cx);
         let Some(guild) = store.selected_guild else { return Vec::new() };
-        let Some(list) = store.member_lists.get(&guild) else {
+        let Some(list) = store.member_rows() else {
             return Vec::new();
         };
         let mut out = Vec::with_capacity(range.len());
@@ -86,10 +89,12 @@ impl Members {
                                 )
                                 .when(user.bot, |d| d.child(bot_tag())),
                         )
-                        .tooltip(tip("Click to message"))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.store.update(cx, |store, cx| store.open_dm(user_id, cx));
-                        }))
+                        .on_click(move |event, window, cx| {
+                            // Beside the member list, which runs down the window's right edge.
+                            let left_of_list = window.viewport_size().width - px(PANEL_WIDTH);
+                            let at = point(left_of_list, event.position().y);
+                            super::form::open_profile(user_id, at, cx);
+                        })
                         .context_menu({
                             let store = self.store.clone();
                             let display = name.clone();
@@ -118,14 +123,15 @@ pub fn bot_tag() -> impl IntoElement {
 impl Render for Members {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
-        let count = store.selected_guild.and_then(|g| store.member_lists.get(&g)).map_or(0, |l| l.len());
-        let key = store.selected_guild.map_or(0, |g| g.0);
+        let count = store.member_rows().map_or(0, |l| l.len());
+        // A list per channel keeps each one's scroll position separate.
+        let key = store.selected_channel.map_or(0, |c| c.0);
 
-        v_flex().w(px(240.)).h_full().flex_shrink_0().bg(theme::bg_sidebar()).child(if count == 0 {
+        v_flex().w(px(PANEL_WIDTH)).h_full().flex_shrink_0().bg(theme::bg_sidebar()).child(if count == 0 {
             div()
                 .p_4()
                 .text_color(theme::text_muted())
-                .child("Members appear here once the server sends them.")
+                .child("Loading members\u{2026}")
                 .into_any_element()
         } else {
             uniform_list(("members", key), count, cx.processor(Self::rows)).flex_1().into_any_element()

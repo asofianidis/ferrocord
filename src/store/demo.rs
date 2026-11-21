@@ -239,7 +239,7 @@ impl Store {
             MemberRow::Group { name: "Offline".into(), count: 1 },
             row(self, 6),
         ];
-        self.member_lists.insert(Id(100), rows);
+        self.member_lists.insert((Id(100), BOT_LIST.to_string()), rows);
         self.typing.insert(
             Id(121),
             vec![TypingUser { user: Id(3), name: "linus (kernel)".into(), at: Instant::now() + Duration::from_secs(3600) }],

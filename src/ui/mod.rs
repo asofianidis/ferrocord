@@ -173,6 +173,10 @@ impl AppView {
         cx.notify();
     }
 
+    pub fn show_profile(&mut self, user: crate::discord::Id, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.chat.update(cx, |chat, cx| chat.show_profile(user, at, Anchor::TopRight, cx));
+    }
+
     pub fn show_events(&mut self, guild: crate::discord::Id, cx: &mut Context<Self>) {
         let view = cx.new(|cx| events::EventsView::new(self.store.clone(), guild, cx));
         self._events_sub = Some(cx.subscribe(&view, |this, _, _: &events::EventsEvent, cx| {

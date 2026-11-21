@@ -14,7 +14,8 @@ use gpui_component::{
 use gpui_kit::assets::IconName;
 use std::rc::Rc;
 
-pub type OnProfile = Rc<dyn Fn(Id, &mut App)>;
+/// Opens a user's profile card at a window position.
+pub type OnProfile = Rc<dyn Fn(Id, Point<Pixels>, &mut App)>;
 
 /// An avatar with a green ring while its owner is speaking.
 pub fn voice_avatar(url: impl Into<SharedString>, size: f32, speaking: bool) -> impl IntoElement {
@@ -132,7 +133,7 @@ pub fn call_panel(
                     .child(voice_flags(member))
                     .when(member.hand_raised, |d| d.child(icon(IconName::Hand, 13., theme::warning()))),
             )
-            .on_click(move |_, _, cx| on_profile(user, cx));
+            .on_click(move |event, _, cx| on_profile(user, event.position(), cx));
         let Some(guild) = guild.filter(|_| (moderator || can_moderate_voice) && user != me) else {
             return element.into_any_element();
         };
