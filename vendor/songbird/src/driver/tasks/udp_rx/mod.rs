@@ -46,9 +46,61 @@ struct UdpRx {
     udp_socket: UdpSocket,
     dave_session: Arc<RwLock<Option<davey::DaveSession>>>,
     dave_protocol_version: Arc<AtomicU16>,
+    /// ferrocord patch: frames being rebuilt, per video SSRC.
+    video_assemblers: HashMap<u32, crate::video::H264Assembler>,
 }
 
 impl UdpRx {
+    /// ferrocord patch: adds one video packet (already transport-decrypted)
+    /// to its frame, and passes finished frames to the video sink.
+    fn handle_video(&mut self, rtp: &RtpPacket<'_>, start: usize, tail: usize) {
+        let Some(sink) = self.config.video_sink.clone() else {
+            return;
+        };
+        let payload = rtp.payload();
+        if start + tail > payload.len() {
+            return;
+        }
+        let mut body = &payload[start..payload.len() - tail];
+        if rtp.get_extension() != 0 {
+            let Some(size) = discortp::rtp::RtpExtensionPacket::new(body).map(|ext| discortp::PacketSize::packet_size(&ext)) else {
+                return;
+            };
+            body = body.get(size..).unwrap_or_default();
+        }
+        let ssrc = rtp.get_ssrc();
+        let seq: u16 = rtp.get_sequence().into();
+        let timestamp: u32 = rtp.get_timestamp().into();
+        let assembler = self.video_assemblers.entry(ssrc).or_default();
+        let Some(frame) = assembler.push(seq, timestamp, rtp.get_marker() != 0, body) else {
+            return;
+        };
+        let user_id = self.ssrc_signalling.video_ssrc_user_map.get(&ssrc).map(|u| u.0);
+
+        // Frames from DAVE calls end with the protocol's magic marker.
+        let encrypted = self.dave_protocol_version.load(Ordering::Relaxed) != 0
+            && frame.len() >= 11
+            && frame[frame.len() - DAVE_MAGIC_MARKER.len()..] == DAVE_MAGIC_MARKER;
+        let data = if encrypted {
+            let Some(user) = user_id else {
+                return;
+            };
+            let mut guard = self.dave_session.write().unwrap();
+            let Some(session) = guard.as_mut().filter(|s| s.is_ready()) else {
+                return;
+            };
+            match session.decrypt(user, davey::MediaType::VIDEO, &frame) {
+                Ok(data) => data,
+                Err(e) => {
+                    debug!(error = ?e, "DAVE video decryption failed");
+                    return;
+                },
+            }
+        } else {
+            frame
+        };
+        drop(sink.send(crate::video::VideoFrame { user_id, ssrc, data }));
+    }
     #[instrument(skip(self))]
     async fn run(&mut self, interconnect: &mut Interconnect) {
         let mut cleanup_time = Instant::now();
@@ -188,6 +240,17 @@ impl UdpRx {
                 } else {
                     None
                 };
+
+                // ferrocord patch: video goes its own way; retransmissions are dropped.
+                let payload_type = rtp.get_payload_type();
+                if payload_type != RTP_PROFILE_TYPE {
+                    if payload_type == discortp::rtp::RtpType::Dynamic(crate::video::H264_PAYLOAD_TYPE) {
+                        if let Some((start, tail, true)) = packet_data {
+                            self.handle_video(&rtp.to_immutable(), start, tail);
+                        }
+                    }
+                    return;
+                }
 
                 if let Some((rtp_body_start, rtp_body_tail, decrypted)) = packet_data {
                     let ssrc = rtp.get_ssrc();
@@ -360,6 +423,7 @@ pub(crate) async fn runner(
         cipher,
         crypto_mode,
         decoder_map: HashMap::new(),
+        video_assemblers: HashMap::new(),
         config,
         rx,
         ssrc_signalling,
@@ -375,5 +439,10 @@ pub(crate) async fn runner(
 
 #[inline]
 fn rtp_valid(packet: &RtpPacket<'_>) -> bool {
-    packet.get_version() == RTP_VERSION && packet.get_payload_type() == RTP_PROFILE_TYPE
+    // ferrocord patch: video and its retransmissions are expected too.
+    let pt = packet.get_payload_type();
+    packet.get_version() == RTP_VERSION
+        && (pt == RTP_PROFILE_TYPE
+            || pt == discortp::rtp::RtpType::Dynamic(crate::video::H264_PAYLOAD_TYPE)
+            || pt == discortp::rtp::RtpType::Dynamic(crate::video::H264_RTX_PAYLOAD_TYPE))
 }

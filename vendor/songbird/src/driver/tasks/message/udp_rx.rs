@@ -15,4 +15,6 @@ pub struct SsrcTracker {
     pub disconnected_users: DashSet<UserId>,
     pub user_ssrc_map: DashMap<UserId, u32>,
     pub ssrc_user_map: DashMap<u32, UserId>,
+    /// ferrocord patch: video SSRCs (every simulcast layer) to their sender.
+    pub video_ssrc_user_map: DashMap<u32, UserId>,
 }

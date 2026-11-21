@@ -10,6 +10,7 @@ mod sounds;
 mod store;
 mod tray;
 mod updater;
+mod video;
 mod voice;
 mod ui;
 

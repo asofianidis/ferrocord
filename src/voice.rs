@@ -52,6 +52,8 @@ pub enum VoiceEvent {
     Speaking(HashSet<Id>),
     /// An audio device could not be used. Voice keeps working without it.
     DeviceProblem(String),
+    /// A new picture from someone's camera or screen.
+    Video { user: Id, image: crate::video::VideoImage },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -63,6 +65,8 @@ pub struct VoiceOptions {
     /// Linear gains: 1.0 leaves the audio as it is.
     pub input_volume: f32,
     pub output_volume: f32,
+    /// Receive only, never opening the microphone (watching a screen share).
+    pub listen_only: bool,
 }
 
 /// Loudness in dBFS of samples' RMS, floored at -100.
@@ -796,8 +800,15 @@ impl VoiceConnection {
             }
         };
 
+        // Video arrives as encoded frames; a thread of its own decodes them.
+        let (video_tx, video_rx) = flume::unbounded();
+        let video_events = events.clone();
+        crate::video::spawn_decoder(video_rx, move |user, image| {
+            video_events.send_blocking(VoiceEvent::Video { user, image }).is_ok()
+        });
         let config = Config::default()
-            .decode_mode(DecodeMode::Decode(DecodeConfig::new(Channels::Stereo, SampleRate::Hz48000)));
+            .decode_mode(DecodeMode::Decode(DecodeConfig::new(Channels::Stereo, SampleRate::Hz48000)))
+            .video_sink(video_tx);
         let mut driver = {
             let _guard = runtime.enter();
             Driver::new(config)
@@ -815,7 +826,13 @@ impl VoiceConnection {
         // Start muted; the pump un-mutes while the voice gate is open.
         driver.mute(true);
 
-        let input = match open_input(shared.clone(), options.input_device.as_deref()) {
+        // A listen-only connection never touches the microphone.
+        let opened = if options.listen_only {
+            Err(String::new())
+        } else {
+            open_input(shared.clone(), options.input_device.as_deref())
+        };
+        let input = match opened {
             Ok((stream, rate)) => {
                 *shared.mic.lock() = MicBuffer::new(rate);
                 shared.has_mic.store(true, Ordering::Relaxed);
@@ -826,7 +843,9 @@ impl VoiceConnection {
                 Some(stream)
             }
             Err(problem) => {
-                let _ = events.try_send(VoiceEvent::DeviceProblem(problem));
+                if !problem.is_empty() {
+                    let _ = events.try_send(VoiceEvent::DeviceProblem(problem));
+                }
                 None
             }
         };

@@ -70,15 +70,21 @@ impl Connection {
         let mut hello = None;
         let mut ready = None;
 
-        client
-            .send_json(&GatewayEvent::from(Identify {
-                server_id: info.guild_id.into(),
-                session_id: info.session_id.clone(),
-                token: info.token.clone(),
-                user_id: info.user_id.into(),
-                max_dave_protocol_version: Some(davey::DAVE_PROTOCOL_VERSION),
-            }))
-            .await?;
+        // ferrocord patch: identify as video-capable, which the typed model
+        // cannot say.
+        let identify = serde_json::json!({
+            "op": 0,
+            "d": {
+                "server_id": info.guild_id.0.to_string(),
+                "session_id": info.session_id,
+                "token": info.token,
+                "user_id": info.user_id.0.to_string(),
+                "max_dave_protocol_version": davey::DAVE_PROTOCOL_VERSION,
+                "video": true,
+                "streams": [],
+            },
+        });
+        client.send_text(identify.to_string()).await?;
 
         loop {
             let Some(value) = client.recv_event().await? else {
@@ -174,22 +180,45 @@ impl Connection {
 
             let address = IpAddr::from_str(address_str).map_err(|_| Error::IllegalIp)?;
 
-            client
-                .send_json(&GatewayEvent::from(SelectProtocol {
-                    protocol: "udp".into(),
-                    data: ProtocolData {
-                        address,
-                        mode: chosen_crypto.to_request_str().into(),
-                        port: view.get_port(),
+            // ferrocord patch: also list the codecs we take: Opus, and H.264
+            // video to decode (we send none).
+            let select = serde_json::json!({
+                "op": 1,
+                "d": {
+                    "protocol": "udp",
+                    "data": {
+                        "address": address.to_string(),
+                        "port": view.get_port(),
+                        "mode": chosen_crypto.to_request_str(),
                     },
-                }))
-                .await?;
+                    "codecs": [
+                        { "name": "opus", "type": "audio", "priority": 1000, "payload_type": 120 },
+                        {
+                            "name": "H264", "type": "video", "priority": 1000,
+                            "payload_type": crate::video::H264_PAYLOAD_TYPE,
+                            "rtx_payload_type": crate::video::H264_RTX_PAYLOAD_TYPE,
+                            "encode": false, "decode": true,
+                        },
+                    ],
+                },
+            });
+            client.send_text(select.to_string()).await?;
         }
 
         let (cipher, dave_session, dave_protocol_version) =
             init_cipher(&mut client, &info, chosen_crypto, &ws_msg_tx).await?;
         let dave_session = Arc::new(RwLock::new(dave_session));
         let dave_protocol_version = Arc::new(dave_protocol_version);
+
+        // ferrocord patch: a Video payload must be sent before any video
+        // flows (ours says we send none), then ask for everyone's video.
+        let video_state = serde_json::json!({
+            "op": 12,
+            "d": { "audio_ssrc": ready.ssrc, "video_ssrc": 0, "rtx_ssrc": 0, "streams": [] },
+        });
+        client.send_text(video_state.to_string()).await?;
+        let sink_wants = serde_json::json!({ "op": 15, "d": { "any": 100 } });
+        client.send_text(sink_wants.to_string()).await?;
 
         info!("Connected to: {}", info.endpoint);
 

@@ -246,7 +246,8 @@ impl Store {
         );
 
         let member = |user: u64, self_mute: bool| VoiceMember { user: Id(user), self_mute, ..Default::default() };
-        self.voice.insert(Id(124), vec![member(2, false), member(3, true)]);
+        // linus is sharing his screen.
+        self.voice.insert(Id(124), vec![member(2, false), VoiceMember { streaming: true, ..member(3, true) }]);
         // A live stage with one speaker, one raised hand and a listener.
         self.stages.insert(Id(125), "Q&A: async Rust in practice".into());
         self.voice.insert(

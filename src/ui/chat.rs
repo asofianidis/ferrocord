@@ -126,6 +126,8 @@ pub struct ChatView {
     replacements: Vec<(String, String)>,
     /// The open profile card: whose, and where it was asked for (window coordinates).
     profile: Option<ProfileCard>,
+    /// Someone's camera, or the watched screen share, shown large over the chat.
+    focused_video: Option<Focus>,
     flash: Option<Id>,
     post_title: Entity<InputState>,
     post_body: Entity<InputState>,
@@ -179,6 +181,7 @@ impl ChatView {
             completion: None,
             replacements: Vec::new(),
             profile: None,
+            focused_video: None,
             flash: None,
             post_title,
             post_body,
@@ -262,7 +265,7 @@ impl ChatView {
                 self.sync_channel(window, cx);
                 cx.notify();
             }
-            StoreEvent::Channels | StoreEvent::Voice => cx.notify(),
+            StoreEvent::Channels | StoreEvent::Voice | StoreEvent::Video => cx.notify(),
             StoreEvent::Commands => {
                 self.completion = self.compute_completion(cx);
                 cx.notify();
@@ -496,6 +499,7 @@ impl ChatView {
         let had_overlay = self.completion.take().is_some()
             || self.picker.take().is_some()
             || self.profile.take().is_some()
+            || self.focused_video.take().is_some()
             || self.panel.take().is_some();
         if had_overlay {
             self.composer.update(cx, |s, cx| s.focus(window, cx));
@@ -1238,6 +1242,52 @@ impl ChatView {
             s.focus(window, cx);
         });
         cx.notify();
+    }
+
+    pub fn focus_video(&mut self, user: Id, cx: &mut Context<Self>) {
+        self.focused_video = Some(Focus::Camera(user));
+        cx.notify();
+    }
+
+    pub fn focus_stream(&mut self, cx: &mut Context<Self>) {
+        self.focused_video = Some(Focus::Stream);
+        cx.notify();
+    }
+
+    /// Video filling the chat area; click or Escape to close.
+    fn render_focused_video(&self, focus: Focus, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let store = self.store.read(cx);
+        let name_of = |user: Id| store.users.get(&user).map(|u| store.display_name(store.selected_guild, u)).unwrap_or_default();
+        let (image, name) = match focus {
+            Focus::Camera(user) => (store.video.get(&user)?.image.clone(), name_of(user)),
+            Focus::Stream => {
+                let watch = store.watching.as_ref()?;
+                (store.stream_video.as_ref()?.image.clone(), format!("{}'s screen", name_of(watch.streamer)))
+            }
+        };
+        Some(
+            v_flex()
+                .id("focused-video")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .bg(gpui::black())
+                .child(
+                    h_flex()
+                        .px_4()
+                        .py_2()
+                        .gap_2()
+                        .text_color(gpui::white())
+                        .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child(name))
+                        .child(div().text_size(px(12.)).opacity(0.7).child("Click or press Esc to close")),
+                )
+                .child(img(image).flex_1().w_full().object_fit(ObjectFit::Contain))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.focused_video = None;
+                    cx.notify();
+                }))
+                .into_any_element(),
+        )
     }
 
     /// Opens a user's profile card beside the point that was clicked.
@@ -2346,7 +2396,15 @@ impl Render for ChatView {
             .when(picker_open, |d| d.child(self.render_picker(cx)))
             .when_some(panel, |d, panel| d.child(self.render_panel(&panel, cx)))
             .when_some(profile, |d, card| d.child(self.render_profile(card, cx)))
+            .children(self.focused_video.and_then(|focus| self.render_focused_video(focus, cx)))
     }
+}
+
+/// What the large video view shows.
+#[derive(Clone, Copy)]
+enum Focus {
+    Camera(Id),
+    Stream,
 }
 
 #[derive(Clone, Copy)]

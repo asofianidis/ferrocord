@@ -61,6 +61,7 @@ impl Settings {
             sensitivity_db: self.input_sensitivity_db,
             input_volume: self.input_volume,
             output_volume: self.output_volume,
+            listen_only: false,
         }
     }
 

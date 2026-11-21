@@ -8,7 +8,9 @@ use std::time::Duration;
 
 #[cfg(feature = "driver")]
 /// The voice gateway version used by the library.
-pub const VOICE_GATEWAY_VERSION: u8 = crate::model::constants::GATEWAY_VERSION;
+// ferrocord patch: video needs voice gateway v5 or later; v8 changes the
+// heartbeat format, so stay on v7.
+pub const VOICE_GATEWAY_VERSION: u8 = 7;
 
 #[cfg(feature = "driver")]
 /// Sample rate of audio to be sent to Discord.

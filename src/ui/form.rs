@@ -281,6 +281,16 @@ pub fn open_profile_beside(user: crate::discord::Id, at: Point<Pixels>, cx: &mut
     with_app(cx, |app, cx| app.show_profile_anchored(user, at, Anchor::TopLeft, cx));
 }
 
+/// Shows the watched screen share large.
+pub fn focus_stream(cx: &mut App) {
+    with_app(cx, |app, cx| app.focus_stream(cx));
+}
+
+/// Shows someone's video large.
+pub fn focus_video(user: crate::discord::Id, cx: &mut App) {
+    with_app(cx, |app, cx| app.focus_video(user, cx));
+}
+
 /// Puts a mention of `user` into the message box.
 pub fn mention(user: crate::discord::Id, window: &mut Window, cx: &mut App) {
     with_app(cx, |app, cx| app.mention(user, window, cx));

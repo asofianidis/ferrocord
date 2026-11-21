@@ -106,6 +106,8 @@ pub mod test_utils;
 #[cfg(feature = "driver")]
 pub mod tracks;
 #[cfg(feature = "driver")]
+pub mod video;
+#[cfg(feature = "driver")]
 mod ws;
 
 #[cfg(all(feature = "driver", feature = "receive"))]

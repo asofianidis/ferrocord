@@ -40,6 +40,7 @@ The official client is an Electron app: high memory use, slow startup, and a slu
 - Voice channels and direct-message calls: join, leave, mute, deafen, speaking indicators, and microphone and speaker selection with an adjustable input sensitivity
 - Stage channels: speakers and audience, raising your hand, and for moderators inviting speakers, moving people to the audience, and starting or ending the stage
 - Voice moderation: server mute, server deafen and disconnect
+- Watching other people's cameras and screen shares (H.264), with a large view; sending your own camera or screen is not supported yet
 
 **Server administration**
 - Server settings: name, icon, the ban list with unbanning, and the audit log
@@ -66,7 +67,7 @@ Discord only offers some features to user accounts: search, friends, GIF search,
 
 ### Not implemented
 
-Video, camera and screen sharing. Voice is built on songbird, which handles audio only, so video would need its own transport, codecs and DAVE frame encryption. 
+Sending your own camera or screen. Watching others works (H.264 only; streams that are AV1-only cannot be shown). 
 
 ### About voice
 

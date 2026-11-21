@@ -268,7 +268,16 @@ impl AuxNetwork {
                 )));
             },
             GatewayEvent::ClientConnect(ev) => {
-                debug!("Received discontinued ClientConnect: {:?}", ev);
+                // ferrocord patch: op 12 ("Video") says which SSRCs carry a
+                // user's video, one per simulcast layer.
+                debug!("Video state: {:?}", ev);
+                #[cfg(feature = "receive")]
+                {
+                    let ssrcs = std::iter::once(ev.video_ssrc).chain(ev.streams.iter().map(|s| s.ssrc));
+                    for ssrc in ssrcs.filter(|s| *s != 0) {
+                        self.ssrc_signalling.video_ssrc_user_map.insert(ssrc, ev.user_id);
+                    }
+                }
             },
             GatewayEvent::ClientDisconnect(ev) => {
                 #[cfg(feature = "receive")]

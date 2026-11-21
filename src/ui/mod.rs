@@ -182,6 +182,14 @@ impl AppView {
         self.chat.update(cx, |chat, cx| chat.show_profile(user, at, side, cx));
     }
 
+    pub fn focus_stream(&mut self, cx: &mut Context<Self>) {
+        self.chat.update(cx, |chat, cx| chat.focus_stream(cx));
+    }
+
+    pub fn focus_video(&mut self, user: crate::discord::Id, cx: &mut Context<Self>) {
+        self.chat.update(cx, |chat, cx| chat.focus_video(user, cx));
+    }
+
     pub fn mention(&mut self, user: crate::discord::Id, window: &mut Window, cx: &mut Context<Self>) {
         self.chat.update(cx, |chat, cx| chat.insert_mention(user, window, cx));
     }

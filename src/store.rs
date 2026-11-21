@@ -65,6 +65,8 @@ pub enum StoreEvent {
     Friends,
     /// Voice connection, voice members or speaking indicators changed.
     Voice,
+    /// A new video picture arrived.
+    Video,
     /// Someone is ringing us in a direct-message call.
     IncomingCall { channel: Id, title: String },
     /// The slash command list for a server or conversation arrived.
@@ -220,6 +222,13 @@ pub struct Store {
     pub self_mute: bool,
     pub self_deaf: bool,
     pub speaking: std::collections::HashSet<Id>,
+    /// The latest picture from each person whose video we receive.
+    pub video: HashMap<Id, crate::video::VideoImage>,
+    /// The screen share being watched, its connection and latest picture.
+    pub watching: Option<StreamWatch>,
+    stream_conn: Option<VoiceConnection>,
+    stream_epoch: u64,
+    pub stream_video: Option<crate::video::VideoImage>,
     /// Direct-message calls in progress, with who is being rung.
     pub calls: HashMap<Id, Vec<Id>>,
     /// Live stages and their topics.
@@ -272,6 +281,15 @@ pub struct AuditLog {
     pub entries: Vec<discord::audit::AuditEntry>,
     /// Users the log mentions, for naming targets.
     pub users: HashMap<Id, User>,
+}
+
+/// A screen share (Go Live) being watched.
+pub struct StreamWatch {
+    pub key: String,
+    pub streamer: Id,
+    pub status: VoiceStatus,
+    rtc_server: Option<Id>,
+    server: Option<(String, String)>,
 }
 
 /// Where checking for and installing an update has got to.
@@ -377,6 +395,11 @@ impl Store {
             self_mute: false,
             self_deaf: false,
             speaking: Default::default(),
+            video: HashMap::new(),
+            watching: None,
+            stream_conn: None,
+            stream_epoch: 0,
+            stream_video: None,
             calls: HashMap::new(),
             stages: HashMap::new(),
             my_status: Status::Online,
@@ -2223,6 +2246,10 @@ impl Store {
         if state.guild_id.is_none() {
             state.guild_id = state.channel_id.and_then(|c| self.channels.get(&c)).and_then(|c| c.guild_id);
         }
+        // Their camera went off, or they left: drop the last picture.
+        if !state.self_video || state.channel_id.is_none() {
+            self.drop_video(state.user_id, cx);
+        }
         // Chime when someone else comes into or leaves the channel we are in.
         let ours = self.voice_session.as_ref().filter(|s| s.status == VoiceStatus::Connected).map(|s| s.channel);
         if let Some(ours) = ours.filter(|_| state.user_id != self.my_id()) {
@@ -2381,6 +2408,14 @@ impl Store {
                 self.speaking = users;
             }
             VoiceEvent::DeviceProblem(problem) => cx.emit(StoreEvent::Error(problem)),
+            VoiceEvent::Video { user, image } => {
+                if let Some(old) = self.video.insert(user, image) {
+                    // GPUI keeps each picture on the GPU until told otherwise.
+                    cx.drop_image(old.image, None);
+                }
+                cx.emit(StoreEvent::Video);
+                return;
+            }
         }
         cx.emit(StoreEvent::Voice);
     }
@@ -2424,6 +2459,29 @@ impl Store {
                 session.status = VoiceStatus::Connected;
             }
             crate::sounds::play(crate::sounds::Sound::Join);
+            // Sample camera: Ada's video is a moving test pattern.
+            cx.spawn(async move |this, cx| {
+                let mut tick = 0u32;
+                loop {
+                    cx.background_executor().timer(std::time::Duration::from_millis(66)).await;
+                    tick += 1;
+                    let still_in_call = this
+                        .update(cx, |store, cx| {
+                            if store.voice_session.is_none() {
+                                return false;
+                            }
+                            if let Some(image) = crate::video::test_pattern(tick) {
+                                store.apply_voice_event(VoiceEvent::Video { user: Id(2), image }, cx);
+                            }
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !still_in_call {
+                        break;
+                    }
+                }
+            })
+            .detach();
             // Sample conversation: someone is already talking.
             self.speaking.insert(if is_stage { Id(4) } else { Id(2) });
         } else {
@@ -2447,10 +2505,151 @@ impl Store {
         });
     }
 
+    // -------------------------------------------------------- screen shares
+
+    /// The key Discord names a screen share by.
+    fn stream_key(&self, streamer: Id) -> Option<String> {
+        let session = self.voice_session.as_ref()?;
+        Some(match session.guild {
+            Some(guild) => format!("guild:{guild}:{}:{streamer}", session.channel),
+            None => format!("call:{}:{streamer}", session.channel),
+        })
+    }
+
+    /// Starts watching someone's screen share in our voice channel.
+    pub fn watch_stream(&mut self, streamer: Id, cx: &mut Context<Self>) {
+        if self.watching.as_ref().is_some_and(|w| w.streamer == streamer) {
+            return;
+        }
+        self.stop_watching(cx);
+        let Some(key) = self.stream_key(streamer) else { return };
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(Command::WatchStream(key.clone()));
+        }
+        self.watching = Some(StreamWatch { key, streamer, status: VoiceStatus::Joining, rtc_server: None, server: None });
+        cx.emit(StoreEvent::Voice);
+        if self.demo {
+            // Sample screen share: a test pattern, until we stop watching.
+            self.stream_epoch += 1;
+            let epoch = self.stream_epoch;
+            cx.spawn(async move |this, cx| {
+                let mut tick = 0u32;
+                loop {
+                    cx.background_executor().timer(std::time::Duration::from_millis(66)).await;
+                    tick += 2;
+                    let watching = this
+                        .update(cx, |store, cx| {
+                            if store.stream_epoch != epoch || store.watching.is_none() {
+                                return false;
+                            }
+                            if let Some(image) = crate::video::test_pattern(tick) {
+                                store.apply_stream_event(VoiceEvent::Video { user: streamer, image }, cx);
+                            }
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !watching {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+    }
+
+    pub fn stop_watching(&mut self, cx: &mut Context<Self>) {
+        let Some(watch) = self.watching.take() else { return };
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(Command::StopStream(watch.key));
+        }
+        self.stream_conn = None;
+        self.stream_epoch += 1;
+        if let Some(old) = self.stream_video.take() {
+            cx.drop_image(old.image, None);
+        }
+        cx.emit(StoreEvent::Voice);
+    }
+
+    /// Connects to the stream's media server once Discord has said where it is.
+    fn try_connect_stream(&mut self, cx: &mut Context<Self>) {
+        let me = self.my_id();
+        let Some(session_id) = self.voice_session.as_ref().and_then(|s| s.session_id.clone()) else { return };
+        let channel = self.voice_session.as_ref().map(|s| s.channel);
+        let Some(watch) = self.watching.as_mut() else { return };
+        let (Some(rtc_server), Some((token, endpoint)), Some(channel)) = (watch.rtc_server, watch.server.clone(), channel)
+        else {
+            return;
+        };
+        watch.status = VoiceStatus::Connecting;
+        let mut options = crate::settings::Settings::load().voice_options();
+        options.listen_only = true;
+        let (tx, rx) = async_channel::unbounded();
+        self.stream_conn = None;
+        let conn = VoiceConnection::start(self.runtime.clone(), &options, me, true, false, tx);
+        conn.connect(ServerInfo { channel, guild_or_channel: rtc_server, user: me, session_id, token, endpoint });
+        self.stream_conn = Some(conn);
+        self.stream_epoch += 1;
+        let epoch = self.stream_epoch;
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = rx.recv().await {
+                let alive = this.update(cx, |store, cx| {
+                    if store.stream_epoch != epoch {
+                        return false;
+                    }
+                    store.apply_stream_event(event, cx);
+                    true
+                });
+                if !matches!(alive, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.emit(StoreEvent::Voice);
+    }
+
+    fn apply_stream_event(&mut self, event: VoiceEvent, cx: &mut Context<Self>) {
+        match event {
+            VoiceEvent::Video { image, .. } => {
+                if let Some(watch) = self.watching.as_mut() {
+                    watch.status = VoiceStatus::Connected;
+                }
+                if let Some(old) = self.stream_video.replace(image) {
+                    cx.drop_image(old.image, None);
+                }
+                cx.emit(StoreEvent::Video);
+            }
+            VoiceEvent::Connected => {
+                if let Some(watch) = self.watching.as_mut() {
+                    watch.status = VoiceStatus::Connected;
+                }
+                cx.emit(StoreEvent::Voice);
+            }
+            VoiceEvent::Disconnected(reason) => {
+                if let Some(watch) = self.watching.as_mut() {
+                    watch.status = VoiceStatus::Failed(reason);
+                }
+                cx.emit(StoreEvent::Voice);
+            }
+            _ => {}
+        }
+    }
+
+    /// Forgets someone's video picture and frees it.
+    fn drop_video(&mut self, user: Id, cx: &mut Context<Self>) {
+        if let Some(old) = self.video.remove(&user) {
+            cx.drop_image(old.image, None);
+        }
+    }
+
     fn end_voice(&mut self, cx: &mut Context<Self>) {
         self.voice_conn = None;
         self.voice_epoch += 1;
         self.speaking.clear();
+        for user in self.video.keys().copied().collect::<Vec<_>>() {
+            self.drop_video(user, cx);
+        }
+        self.stop_watching(cx);
         if let Some(session) = self.voice_session.take() {
             if self.demo {
                 let me = self.my_id();
@@ -3890,6 +4089,29 @@ impl Store {
                     }
                 }
                 cx.emit(StoreEvent::Channels);
+            }
+            Event::StreamCreate { key, rtc_server_id } => {
+                if let Some(watch) = self.watching.as_mut().filter(|w| w.key == key) {
+                    watch.rtc_server = rtc_server_id;
+                    self.try_connect_stream(cx);
+                }
+            }
+            Event::StreamServer { key, token, endpoint } => {
+                if let (Some(watch), Some(endpoint)) = (self.watching.as_mut().filter(|w| w.key == key), endpoint) {
+                    watch.server = Some((token, endpoint));
+                    self.try_connect_stream(cx);
+                }
+            }
+            Event::StreamDelete { key, reason } => {
+                if self.watching.as_ref().is_some_and(|w| w.key == key) {
+                    self.stop_watching(cx);
+                    let why = match reason.as_deref() {
+                        Some("stream_full") => "The stream is full.",
+                        Some("unauthorized") => "You are not allowed to watch this stream.",
+                        _ => "The stream ended.",
+                    };
+                    cx.emit(StoreEvent::Notice(why.into()));
+                }
             }
             Event::Emojis { guild_id, emojis } => {
                 if let Some(state) = self.guild_mut(guild_id) {

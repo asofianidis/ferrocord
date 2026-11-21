@@ -89,6 +89,11 @@ pub enum Event {
     MemberRemove { guild_id: Id, user_id: Id },
     /// The account's own user object changed.
     UserUpdate(Box<User>),
+    /// A screen share we asked to watch: which media server carries it,
+    /// how to reach it, and when it ends.
+    StreamCreate { key: String, rtc_server_id: Option<Id> },
+    StreamServer { key: String, token: String, endpoint: Option<String> },
+    StreamDelete { key: String, reason: Option<String> },
     /// A server's custom emoji or stickers were replaced.
     Emojis { guild_id: Id, emojis: Vec<Emoji> },
     Stickers { guild_id: Id, stickers: Vec<StickerItem> },
@@ -104,6 +109,9 @@ pub enum Command {
     SetStatus(Status),
     /// Join, move within or (with no channel) leave voice.
     UpdateVoiceState { guild_id: Option<Id>, channel_id: Option<Id>, self_mute: bool, self_deaf: bool },
+    /// Start or stop watching someone's screen share (Go Live), by stream key.
+    WatchStream(String),
+    StopStream(String),
     Shutdown,
 }
 
@@ -269,6 +277,18 @@ async fn connect(
                             "self_deaf": self_deaf,
                             "self_video": false,
                         }});
+                        if let Err(e) = ws.send(WsMessage::text(payload.to_string())).await {
+                            return reconnect(format!("send failed: {e}"));
+                        }
+                    }
+                    Some(Command::WatchStream(key)) => {
+                        let payload = json!({ "op": 20, "d": { "stream_key": key } });
+                        if let Err(e) = ws.send(WsMessage::text(payload.to_string())).await {
+                            return reconnect(format!("send failed: {e}"));
+                        }
+                    }
+                    Some(Command::StopStream(key)) => {
+                        let payload = json!({ "op": 19, "d": { "stream_key": key } });
                         if let Err(e) = ws.send(WsMessage::text(payload.to_string())).await {
                             return reconnect(format!("send failed: {e}"));
                         }
@@ -532,6 +552,19 @@ fn dispatch(state: &mut State, kind: &str, mut d: Value) -> Vec<Event> {
         "RELATIONSHIP_REMOVE" => one(id_of(&d["id"]).map(|id| Event::Relationship { id, user: None, kind: None })),
         "USER_GUILD_SETTINGS_UPDATE" => vec![Event::Mutes(parse_mutes(&d))],
         "VOICE_STATE_UPDATE" => one(parse::<VoiceState>(d, kind).map(|v| Event::VoiceState(Box::new(v)))),
+        "STREAM_CREATE" => vec![Event::StreamCreate {
+            key: d["stream_key"].as_str().unwrap_or_default().to_string(),
+            rtc_server_id: id_of(&d["rtc_server_id"]),
+        }],
+        "STREAM_SERVER_UPDATE" => vec![Event::StreamServer {
+            key: d["stream_key"].as_str().unwrap_or_default().to_string(),
+            token: d["token"].as_str().unwrap_or_default().to_string(),
+            endpoint: d["endpoint"].as_str().filter(|e| !e.is_empty()).map(str::to_string),
+        }],
+        "STREAM_DELETE" => vec![Event::StreamDelete {
+            key: d["stream_key"].as_str().unwrap_or_default().to_string(),
+            reason: d["reason"].as_str().map(str::to_string),
+        }],
         "VOICE_SERVER_UPDATE" => vec![Event::VoiceServer {
             guild_id: id_of(&d["guild_id"]),
             channel_id: id_of(&d["channel_id"]),

@@ -75,6 +75,11 @@ impl WsStream {
         convert_ws_message(self.0.try_next().await?)
     }
 
+    /// ferrocord patch: sends a payload the typed model cannot express.
+    pub(crate) async fn send_text(&mut self, text: String) -> Result<()> {
+        Ok(self.0.send(Message::text(text)).await?)
+    }
+
     pub(crate) async fn send_json(&mut self, value: &Event) -> Result<()> {
         let res = crate::json::to_string(value);
         let res = res.map(Message::text);

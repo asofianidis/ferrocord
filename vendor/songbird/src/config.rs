@@ -61,6 +61,10 @@ pub struct Config {
     /// [`DecodeMode::Pass`]: DecodeMode::Pass
     /// [User speaking state]: crate::events::CoreEvent::VoiceTick
     pub decode_mode: DecodeMode,
+    #[cfg(feature = "receive")]
+    /// ferrocord patch: where to send other people's decrypted video frames.
+    /// `None` (the default) receives no video.
+    pub video_sink: Option<flume::Sender<crate::video::VideoFrame>>,
 
     #[cfg(all(feature = "driver", feature = "receive"))]
     /// Configures the amount of time after a user/SSRC is inactive before their decoder state
@@ -211,6 +215,8 @@ impl Default for Config {
             crypto_mode: CryptoMode::Aes256Gcm,
             #[cfg(all(feature = "driver", feature = "receive"))]
             decode_mode: DecodeMode::Decrypt,
+            #[cfg(feature = "receive")]
+            video_sink: None,
             #[cfg(all(feature = "driver", feature = "receive"))]
             decode_state_timeout: Duration::from_secs(60).into(),
             #[cfg(all(feature = "driver", feature = "receive"))]
@@ -261,6 +267,14 @@ impl Config {
     #[must_use]
     pub fn decode_mode(mut self, decode_mode: DecodeMode) -> Self {
         self.decode_mode = decode_mode;
+        self
+    }
+
+    #[cfg(feature = "receive")]
+    /// ferrocord patch: receive video, sending frames to `sink`.
+    #[must_use]
+    pub fn video_sink(mut self, sink: flume::Sender<crate::video::VideoFrame>) -> Self {
+        self.video_sink = Some(sink);
         self
     }
 

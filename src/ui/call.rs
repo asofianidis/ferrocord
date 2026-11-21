@@ -77,6 +77,11 @@ fn status_text(status: &VoiceStatus) -> (String, Hsla) {
 }
 
 /// The panel above a voice channel's, stage's or call's messages.
+/// Size of a video tile in the call panel.
+const VIDEO_TILE: (f32, f32) = (320., 180.);
+/// Height of a watched screen share in the call panel.
+const STREAM_HEIGHT: f32 = 360.;
+
 pub fn call_panel(
     store_entity: &Entity<Store>,
     channel: Id,
@@ -101,6 +106,8 @@ pub fn call_panel(
     let topic = store.stages.get(&channel).cloned();
     let my_member = members.iter().find(|m| m.user == me).cloned();
 
+    let in_call = joined.is_some();
+    let watching_user = store.watching.as_ref().map(|w| w.streamer);
     let tile = |member: &VoiceMember, size: f32| -> AnyElement {
         let user = member.user;
         let (name, url) = match store.users.get(&user) {
@@ -109,16 +116,33 @@ pub fn call_panel(
         };
         let speaking = store.speaking.contains(&user);
         let on_profile = on_profile.clone();
+        // Someone sending video shows it in a 16:9 tile instead of their avatar.
+        let video = store.video.get(&user).map(|v| v.image.clone());
+        let has_video = video.is_some();
+        let width = if has_video { VIDEO_TILE.0 } else { size + 40. };
         let element = v_flex()
             .id(("voice-tile", user.0))
-            .w(px(size + 40.))
+            .w(px(width))
             .items_center()
             .gap_1()
             .cursor_pointer()
-            .child(voice_avatar(url, size, speaking))
+            .map(|d| match video {
+                Some(image) => d.child(
+                    div()
+                        .w(px(VIDEO_TILE.0))
+                        .h(px(VIDEO_TILE.1))
+                        .rounded_lg()
+                        .overflow_hidden()
+                        .bg(gpui::black())
+                        .border_2()
+                        .border_color(if speaking { theme::online() } else { gpui::transparent_black() })
+                        .child(img(image).size_full().object_fit(ObjectFit::Contain)),
+                ),
+                None => d.child(voice_avatar(url, size, speaking)),
+            })
             .child(
                 h_flex()
-                    .max_w(px(size + 40.))
+                    .max_w(px(width))
                     .gap_1()
                     .child(
                         div()
@@ -131,7 +155,28 @@ pub fn call_panel(
                     .child(voice_flags(member))
                     .when(member.hand_raised, |d| d.child(icon(IconName::Hand, 13., theme::warning()))),
             )
-            .on_click(move |event, _, cx| on_profile(user, event.position(), cx));
+            .when(member.streaming && user != me && in_call, |d| {
+                let entity = store_entity.clone();
+                let watching = watching_user == Some(user);
+                d.child(
+                    button(("watch", user.0), if watching { "Stop" } else { "Watch" }, if watching {
+                        ButtonStyle::Plain
+                    } else {
+                        ButtonStyle::Primary
+                    })
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        entity.update(cx, |s, cx| if watching { s.stop_watching(cx) } else { s.watch_stream(user, cx) });
+                    }),
+                )
+            })
+            .on_click(move |event, _, cx| {
+                if has_video {
+                    super::form::focus_video(user, cx);
+                } else {
+                    on_profile(user, event.position(), cx);
+                }
+            });
         let entity = store_entity.clone();
         let member = member.clone();
         let stage_moderator = is_stage && moderator && user != me;
@@ -277,10 +322,65 @@ pub fn call_panel(
         body = body.child(h_flex().flex_wrap().gap_3().children(members.iter().map(|m| tile(m, 48.))));
     }
 
+    // The screen share being watched, if its streamer is in this channel.
+    let stream = store
+        .watching
+        .as_ref()
+        .filter(|w| members.iter().any(|m| m.user == w.streamer))
+        .map(|watch| {
+            let name = store.users.get(&watch.streamer).map(|u| store.display_name(guild, u)).unwrap_or_default();
+            let stop = store_entity.clone();
+            let screen = match (&store.stream_video, &watch.status) {
+                (Some(video), _) => div()
+                    .id("stream-video")
+                    .w_full()
+                    .h(px(STREAM_HEIGHT))
+                    .rounded_lg()
+                    .overflow_hidden()
+                    .bg(gpui::black())
+                    .cursor_pointer()
+                    .child(img(video.image.clone()).size_full().object_fit(ObjectFit::Contain))
+                    .on_click(|_, _, cx| super::form::focus_stream(cx))
+                    .into_any_element(),
+                (None, VoiceStatus::Failed(reason)) => {
+                    div().text_color(theme::danger()).child(format!("Could not watch the stream: {reason}")).into_any_element()
+                }
+                (None, _) => div()
+                    .w_full()
+                    .h(px(120.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_lg()
+                    .bg(gpui::black())
+                    .text_color(gpui::white())
+                    .child("Connecting to the stream\u{2026}")
+                    .into_any_element(),
+            };
+            v_flex()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(icon(IconName::MonitorUp, 14., theme::danger()))
+                        .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child(format!("{name}'s screen")))
+                        .child(
+                            button("stream-full", "Full Window", ButtonStyle::Plain)
+                                .on_click(|_, _, cx| super::form::focus_stream(cx)),
+                        )
+                        .child(
+                            button("stream-stop", "Stop Watching", ButtonStyle::Danger)
+                                .on_click(move |_, _, cx| stop.update(cx, |s, cx| s.stop_watching(cx))),
+                        ),
+                )
+                .child(screen)
+        });
+    let watching_here = stream.is_some();
+
     Some(
         v_flex()
             .flex_shrink_0()
-            .max_h(px(380.))
+            .max_h(px(if watching_here { 380. + STREAM_HEIGHT } else { 380. }))
             .id("call-panel")
             .overflow_y_scroll()
             .px_4()
@@ -291,6 +391,7 @@ pub fn call_panel(
             .bg(theme::bg_sidebar())
             // Controls stay at the top so a long participant list cannot push them out of view.
             .child(h_flex().gap_3().flex_wrap().child(div().flex_1().min_w(px(160.)).child(header_title)).child(actions))
+            .children(stream)
             .child(body)
             .into_any_element(),
     )

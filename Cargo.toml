@@ -1,6 +1,6 @@
 [package]
 name = "ferrocord"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2024"
 description = "A fast, native Discord client written in Rust"
 
@@ -38,6 +38,10 @@ qrcode = { version = "0.14", default-features = false }
 cargo-packager-updater = "0.2"
 semver = "1"
 symphonia = { version = "0.5", default-features = false, features = ["pcm"] }
+openh264 = "0.9.10"
+flume = "0.11"
+image = { version = "0.25", default-features = false }
+smallvec = "1"
 
 [profile.dev]
 opt-level = 1
@@ -48,6 +52,8 @@ opt-level = 2
 [patch.crates-io]
 # Fixes decoding of DAVE-encrypted voice; see vendor/songbird/FERROCORD-PATCH.md.
 songbird = { path = "vendor/songbird" }
+# Keeps the video stream list in voice op 12; see vendor/serenity-voice-model/FERROCORD-PATCH.md.
+serenity-voice-model = { path = "vendor/serenity-voice-model" }
 
 [build-dependencies]
 winresource = "0.1"
